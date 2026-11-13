@@ -1,165 +1,141 @@
-# Chowk — Architecture
+# Chowk — Architecture (Neon / free-tier revision)
 
-> **Status of the spec.** The product specification referred to in the brief was not attached to the
-> session and is not in the repository. This document is built from the brief itself (mobile-first
-> multiplayer IRL city exploration, launching in Saddar, Karachi; guest sessions, quests, parties,
-> verification; fictional placeholder content). Every assumption is listed in
-> [`open-questions.md`](./open-questions.md) and must be reconciled with the real spec before M1.
+> **Revision 2.** Supabase has been removed completely. The product specification was never attached (see
+> [`open-questions.md`](./open-questions.md)); all product behaviour is unchanged from revision 1.
+> Every external service, quota and limitation is in [`free-tier.md`](./free-tier.md). **Constraint: free resources only.**
 
 ## 1. System overview
 
 ```
- ┌────────────────────────── Phone (PWA, mobile web) ──────────────────────────┐
- │ Next.js App Router UI · Tailwind/shadcn · Zustand · MapLibre · R3F          │
- │  ├─ HTTPS  ───────────────►  Next.js route handlers / server actions        │
- │  ├─ Supabase JS (anon key, user JWT, RLS) ─► Supabase (Postgres+Auth)       │
- │  └─ WSS (Colyseus client, JWT in join options) ─► Realtime server           │
- └──────────────────────────────────────────────────────────────────────────────┘
-        Next.js (Vercel)                    Colyseus (Node, 1 region, Fly/Render/Railway)
-        - SSR shell, SEO, auth callbacks    - PartyRoom: presence, readiness, run state
-        - BFF for non-realtime writes       - SERVER-AUTHORITATIVE verification
-        - never holds service-role key      - holds service-role key (only place besides jobs)
-                         \                      /
-                          ▼                    ▼
-                    Supabase Postgres (RLS on every table, PostGIS)
-                    Supabase Auth (anonymous sign-in + email upgrade)
-                    Map tiles: self-hosted/ vendor vector tiles (open question OQ-7)
+ Phone / desktop browser (PWA)
+ Next.js UI · Tailwind/shadcn · Zustand · MapLibre · React Three Fiber · colyseus.js
+   │  HTTPS (cookie session)                         │  WSS (short-lived signed join ticket)
+   ▼                                                  ▼
+ Next.js on Cloudflare Workers (OpenNext)            Colyseus on Render free web service  ← may SLEEP / restart
+  - pages, route handlers, server services            - lobby + party presence, chat, emotes (ephemeral memory)
+  - Better Auth (self-hosted) + Drizzle               - NO database credentials, NO privileged writes
+  - ALL privileged game writes (verification,         - verifies ticket signature with a PUBLIC key
+    rewards, moderation) happen here                  
+   │ Drizzle over Neon serverless driver (WebSocket Pool), role = chowk_app (RLS enforced)
+   ▼
+ Neon Postgres (Free): pooled endpoint (-pooler) for runtime, direct endpoint for migrations only
+   └─ also: object storage via StorageAdapter (Neon Object Storage or Cloudinary; photos private)
 ```
 
-**Principle:** the phone is an untrusted *sensor and display*. It reports a GPS fix and renders state.
-Everything that grants progress (verification, step advancement, stamps) happens on the Colyseus server,
-which writes to Postgres with the service role through a narrow, audited module (`packages/db/server`).
+**Principles (unchanged):** the client is an untrusted sensor and display; the server decides progress; raw GPS is never stored or rebroadcast.
+**New principles:** (1) *the database enforces ownership* — services connect as a restricted role subject to RLS; (2) *the realtime tier holds no secrets that can touch data*; (3) *free tiers are best-effort* — every component must degrade gracefully when asleep.
 
-### Why this split
-| Concern | Where | Reason |
+### What changed from revision 1 (and why)
+| Revision 1 | Revision 2 | Reason |
 |---|---|---|
-| UI, routing, SSR shell, installable PWA | Next.js | App Router, streaming, easy mobile perf budgets |
-| Durable data, auth, RLS | Supabase | One managed Postgres; RLS gives defence in depth |
-| Party presence, live run state, verification | Colyseus | Stateful rooms, reconnection, schema-based patching; a serverless host cannot hold sockets |
-| Shared types | `packages/contracts` (Zod) | One definition for HTTP, WS and content files; runtime-validated |
-
-Rejected: Supabase Realtime for game state (no authoritative server logic, weaker anti-cheat);
-a custom Express+ws server (re-implements Colyseus rooms, reconnection, and state sync).
+| Supabase Postgres + PostgREST + RLS via `auth.uid()` | Neon Postgres + Drizzle; RLS via transaction-local `app.user_id` | Supabase removed. No PostgREST: **no database endpoint is exposed to browsers**; only our server routes touch the DB |
+| Supabase Auth (anonymous sign-in, same uid on upgrade) | Self-hosted Better Auth + anonymous plugin; **guest→member progress is migrated in a DB transaction** | Neon-managed Better Auth has no anonymous plugin (verified). uid does **not** stay the same any more |
+| Colyseus verifies steps, writes DB with service-role key | **Verification runs in Next.js server routes**; Colyseus is presence/chat only with no DB access | Colyseus runs on a sleeping, restartable free host; privileged writes must not live there, and a leaked realtime host must not equal DB compromise |
+| Colyseus authenticates with a Supabase JWT | Realtime **join ticket** (short-lived, audience-bound, asymmetric signature) | no external IdP to verify against |
+| `pg_cron` retention | Authenticated internal route + free scheduler | `pg_cron` on Neon Free not verified |
+| Redis for scale-out | none | single free instance |
+| `party_sync` used live GPS ring buffer in Colyseus | `party_sync` uses members' **recent accepted check-ins** (see §4.4) | verification moved server-side without realtime state |
 
 ## 2. Monorepo layout
 
 ```
-chowk/
-├─ apps/
-│  ├─ web/                 # Next.js App Router PWA                      (M0)
-│  └─ realtime/            # Colyseus server                             (M3)
-├─ packages/
-│  ├─ contracts/           # Zod schemas + WS message contracts  ← EXISTS, typechecks
-│  ├─ game-core/           # Pure logic: geo math, verification rules, quest state machine
-│  ├─ db/                  # Typed Supabase clients; /browser, /server (service-role) entry points
-│  ├─ ui/                  # shadcn/ui components, design tokens, Tailwind preset
-│  ├─ map/                 # MapLibre wrapper components/hooks
-│  ├─ scene3d/             # React Three Fiber scenes (lazy-loaded)
-│  └─ config/              # shared tsconfig, eslint, dependency-cruiser rules
-├─ supabase/
-│  ├─ migrations/          # 20261113000000_init.sql  ← EXISTS, applied+smoke-tested on PG16
-│  └─ tests/               # rls_smoke.sql (pgTAP in M1)
-├─ content/placeholder/    # Fictional quest JSON, validated by QuestContentFile in CI
-├─ tests/e2e/              # Playwright
-└─ docs/
+apps/web                Next.js App Router (M0/Prompt 4)
+apps/realtime           Colyseus (Prompt 5)
+packages/contracts      Zod: domain, HTTP (api.ts) and Colyseus (realtime.ts) contracts          ✅
+packages/ports          Adapter interfaces: DatabaseAdapter, AuthAdapter, RealtimeTicketAdapter, StorageAdapter ✅
+packages/db             Drizzle, env validation, RLS identity binding, privileged-role guard, drivers ✅ (15 tests, real PG)
+packages/storage        StorageAdapter implementations: local-fs ✅ (3 tests); neon-s3 / cloudinary after spike
+packages/game-core      Pure rules: geodesic math, verification, quest state machine
+packages/ui             shadcn/ui + tokens
+packages/map            MapLibre wrappers
+packages/scene3d        R3F scenes (lazy)
+packages/config         shared tsconfig / eslint / boundary rules
+content/placeholder     Fictional content (PLACEHOLDER)
+tests/e2e               Playwright
 ```
 
-### Package boundaries and dependency rules
-
-Allowed edges only (arrow = "may import"). Enforced by `dependency-cruiser` in CI (M0) — a violation fails the build.
-
+### Dependency rules (enforced by dependency-cruiser from M0)
 ```
-contracts   → (zod only)
-game-core   → contracts
-db          → contracts                      (db/server is importable ONLY by apps/realtime and scripts)
-ui          → (react, radix, tailwind)       (no game logic, no contracts imports except types)
-map         → contracts, game-core(types)
-scene3d     → contracts
-apps/web    → contracts, game-core, db/browser, ui, map, scene3d, colyseus.js
-apps/realtime → contracts, game-core, db/server, colyseus
+contracts → zod            ports → contracts           game-core → contracts
+db → contracts, ports, drizzle-orm, pg, @neondatabase/serverless
+storage → ports            map, scene3d → contracts
+apps/web → contracts, ports, db, storage, game-core, ui, map, scene3d, colyseus.js, better-auth
+apps/realtime → contracts, ports(types), game-core, @colyseus/*, jose    ← NEVER imports db or storage
 ```
+1. No package imports an app; no app imports another app.
+2. **`apps/realtime` must not depend on `@chowk/db`.** It has no database driver, no DB URL.
+3. Nothing but `packages/db` may import `pg` / `@neondatabase/serverless` / `drizzle-orm` driver entrypoints; nothing but `apps/web/lib/auth` may read auth tables.
+4. All DB access goes through `DatabaseAdapter.withActor()` — there is deliberately no exported "raw pool" for services.
+5. `drizzle.config.ts` is the **only** reader of `DATABASE_URL_UNPOOLED` (owner role). Runtime env schemas have no field for it.
+6. Heavy client libraries (`map`, `scene3d`) are dynamically imported.
 
-Hard rules:
-1. **No package imports from `apps/*`.** No app imports another app.
-2. `apps/web` must never import `db/server`, `@colyseus/core`, or read `SUPABASE_SERVICE_ROLE_KEY`. CI greps the client bundle for the key name.
-3. `game-core` is pure (no I/O, no `Date.now()` — time is injected) so rules are unit-testable and shared between server verification and client hints.
-4. `contracts` has one runtime dependency (`zod`). No React, no Node APIs.
-5. `scene3d` and `map` are loaded with `next/dynamic` (`ssr:false`) so they never enter the initial JS budget.
-6. Any new cross-package edge requires an ADR line in this file.
+## 3. Replaceable adapters (ports)
+| Port | Interface | Implementations | Swap impact |
+|---|---|---|---|
+| Database | `DatabaseAdapter<Tx>` `{withActor, ping, close}` | `createNeonAdapter` (WebSocket pool; Workers) · `createNodeAdapter` (`pg`; Render, scripts, tests, any Postgres) | Any Postgres with the 001 bootstrap works (Neon → local → another host) |
+| Authentication | `AuthAdapter` `{getSession, deleteUser}` + `RealtimeTicketAdapter` | Better Auth (self-hosted) | App code depends only on `AuthSession {userId,isGuest}` |
+| Storage | `StorageAdapter` `{putPrivate, createSignedReadUrl, delete}` | `local-fs` (dev/test) · Neon Object Storage / Cloudinary (after spike) | Keys are server-generated; callers never see provider SDKs |
 
-### Tech decisions
-- **TypeScript strict** with `noUncheckedIndexedAccess` + `exactOptionalPropertyTypes` (`tsconfig.base.json`).
-- **State:** server state via Server Components/route handlers + TanStack-free minimal fetch; **Zustand** only for client-ephemeral state (map viewport, current room connection, UI sheets). Zustand stores never persist location.
-- **Colyseus state schema is minimal** (party roster, ready flags, run progress). Position is *not* in synced state; coarse cells are sent as discrete messages only when sharing is on (see protocol doc).
-- **Zod 4** at every trust boundary: HTTP bodies, WS payloads, content files, env vars (`packages/config/env.ts`, M0).
-- **Mobile performance budgets** (enforced in CI via Lighthouse/size-limit, M0): initial route ≤ 170 KB gzipped JS; map chunk lazy; R3F chunk lazy and only on `/quest/[id]/reveal` style screens; LCP ≤ 2.5 s on throttled 4G mid-tier Android; GPS sampled at ≤ 0.5 Hz, `watchPosition` stopped when the tab is hidden.
+## 4. Core flows
 
-## 3. Flows
+### 4.1 Request → database identity (RLS propagation)
+1. Route handler calls `auth.getSession(req.headers)` → verified server-side session (cookie, `HttpOnly; Secure; SameSite=Lax`).
+2. Handler calls `db.withActor({kind:"user", userId}, tx => …)`.
+3. Adapter opens **one transaction**; first statement: `select set_config('app.user_id', $1, true)` (transaction-local; `$1` bound & UUID-validated). Then caller queries run as role `chowk_app`.
+4. RLS policies read `app.current_user_id()`. COMMIT/ROLLBACK resets it, so a pooled connection never carries identity to another request (**tested on a single reused connection and 40 concurrent transactions**).
+5. Admin/moderator is **never** a setting: policies look up `profiles.role` inside Postgres.
+6. Privileged server actions (reward issuance, verification outcome writes) are **`SECURITY DEFINER` SQL functions** owned by the migrator role with fixed logic and explicit checks — not a `system` bypass.
+Honest limit: `chowk_app` can technically call `set_config` itself, so RLS defends against **application bugs** (missing `WHERE`, IDOR, forgotten checks) and against browser-side tampering, **not against arbitrary SQL execution by compromised server code**. See `security.md` §5.
 
-### 3.1 Authentication and guest sessions
-1. First visit: user sees `/welcome`. They accept Terms/Privacy (consent ledger rows) and choose **Play as guest** or **Sign in**.
-2. **Guest:** `supabase.auth.signInAnonymously()` (Turnstile-protected, OQ-5). A real `auth.users` row is created with `is_anonymous=true`; a DB trigger creates `profiles` with a random `Guest-xxxxx` name. Guests have the same `authenticated` DB role, so RLS and RPCs work unchanged; differences are policy-level (see security doc).
-3. **Upgrade:** `supabase.auth.updateUser({ email })` / `linkIdentity` — **the user id does not change**, so runs, stamps and party membership carry over with zero data migration.
-4. **Guest lifecycle:** anonymous users inactive > 30 days are deleted by a scheduled job (cascade deletes everything). Guests are told this at creation.
-5. **Realtime auth:** client passes the current Supabase access token in `PartyJoinOptions.accessToken`. Colyseus `onAuth` verifies signature (JWKS), `exp`, `aud`, and reads `sub` + `is_anonymous`. Token is never stored in room state or logged. On token expiry mid-session the client reconnects with a fresh token (rooms allow reconnection, 60 s).
-6. **Sign-out / delete account:** `DELETE /api/account` calls the admin API → cascade. Also exposed in `/settings/privacy`.
+### 4.2 Authentication and guest sessions
+- **Providers:** Google OAuth; email magic link (**only when a free email sender is configured** — otherwise feature-flagged off, see `free-tier.md` §2); guest (Better Auth anonymous plugin).
+- **Guest:** one tap → anonymous user + session cookie; random `Guest-xxxxx` profile; limited by rate limits, 30-day inactivity purge, and no ability to create public content.
+- **Upgrade (account linking):** a guest signs in with Google/magic link while holding a guest session → Better Auth `onLinkAccount({anonymousUser, newUser})` runs our **`transfer_guest_progress(guest_id, new_id)` SQL function in one transaction**: reassigns `quest_completions`, `quest_step_progress`, `user_badges`, `characters`, `party_members`, `consent_records`; resolves conflicts (existing new-user rows win; duplicate badges deduplicated by unique key); then the guest user is deleted. All-or-nothing; replayable-safe (idempotent on `guest_id`).
+- **Account deletion:** `DELETE /api/account` → `AuthAdapter.deleteUser` → FK `ON DELETE CASCADE`; storage objects for the user deleted first (list by key prefix); audit row without PII.
+- **Sessions:** server-stored sessions, rotation on privilege change, short idle expiry for guests.
 
-### 3.2 Quest progression
-State machine (implemented in `game-core`, executed only by the realtime server):
+### 4.3 Realtime join (no shared DB secret)
+`POST /api/realtime/ticket` (session required, rate-limited) → returns a signed ticket `{sub, guest, aud:"lobby"|"party", exp ≤ 60 s}` signed with **Ed25519 private key held only by Next.js**. Colyseus holds the **public key**, verifies signature/`aud`/`exp` in `onAuth`, and nothing else. Colyseus therefore cannot read or write user data. Block/mute lists and party membership needed by rooms are fetched by the web app and embedded in the ticket claims (small, signed, short-lived) — so the room needs no DB.
 
-```
-Run:   active ──all steps completed──► completed
-        │ └─abandon (any member / leader if party)──► abandoned
-        └─ expires_at passed (12 h) ───────────────► expired
+### 4.4 Quest progression and verification (server-side, in Next.js)
+- Run state machine unchanged (`active → completed/abandoned/expired`; steps `locked → available → verifying → completed`), implemented in `game-core`, persisted via `withActor` + `SECURITY DEFINER` functions.
+- **Replay protection:** every verification carries `attemptNonce` (UUID); `verification_attempts` has a unique `(step_progress_id, attempt_nonce)`; QR tokens are single-use (`jti` unique, consumed in the same transaction as the step advance).
+- **GPS:** foreground fix posted only on user action; server computes geodesic distance (`game-core`), applies geofence radius + accuracy gate; stores outcome, distance **band**, coarse district — **never coordinates**.
+- **Dwell/plausibility (alternative implementation):** there is no live position stream server-side any more. Replace "dwell over N seconds" with a **two-fix check-in**: client sends fix #1, server issues a time-bound challenge, client sends fix #2 ≥ `minDwellSec` later; server compares both (and implied speed vs the previous accepted check-in held as a *band/timestamp*, not coordinates). Weaker than a continuous stream; acceptable because rewards are cosmetic.
+- **`party_sync` (alternative):** counts distinct party members with an **accepted check-in for that step within `windowSec`** (timestamps only) instead of live proximity between members.
+- Colyseus is only *told* about changes via an **untrusted `run.changed` hint** relayed between clients; receivers refetch from the API, which is authoritative.
 
-Step:  locked ──previous completed──► available ──verify request──► verifying
-                                          ▲                            │ accepted ─► completed
-                                          └──── rejected / timeout ────┘
-```
-- A **run** is the single model for solo and party play. `quest_runs.party_id` is null for solo.
-- `quest_run_members` is a snapshot of who participates; late joiners are not added in v1.
-- Steps are strictly ordered by `ordinal`. Exactly one step is `available` at a time (v1).
-- `content_version` is pinned on the run so editing a quest never corrupts in-flight runs.
-- On last step accepted: run → `completed`, stamps granted to every member present in the run, `run.completed` broadcast.
-- Reveal policy: target locations are `on_step` by default — RLS only returns a location once its step is `available` for a run you belong to (exploration, and anti-spoiling).
+### 4.5 Party management
+Parties, members, invitations live in Postgres (RLS: members see their party; invitations visible to inviter/invitee; blocks enforced in the `invite`/`join` SQL functions both ways). Presence/ready state and coarse-cell sharing are ephemeral in the Colyseus party room. Size 2–6, one live party per user (partial unique index), leader promotion in SQL.
 
-### 3.3 Party management
-- **Create** (`rpc create_party`): leader gets a 6-char join code, TTL 30 min, size 2–6. Code alphabet excludes ambiguous characters.
-- **Join** (`rpc join_party(code)`): uniform failure for unknown/expired/full (no probing). Rate-limited per user and per IP at the edge (ABUSE-2).
-- **One live party per user** — unique partial index.
-- **Presence & readiness** are Colyseus state (`party` room). Postgres records membership; the room records who is connected/ready.
-- **Leader leaves** → oldest member promoted; empty → disbanded. **Kick** is leader-only, executed server-side, audited.
-- **Starting a run:** leader sends `run.start` when ≥ `min_party_size` members are ready; server creates `quest_runs`/`quest_run_members`/`quest_run_steps` in one transaction and flips party to `in_run`.
-- **Disconnects:** a member offline > 5 min is marked disconnected (still a member); `party_sync` steps count only connected members.
+### 4.6 Scheduled jobs
+Retention sweep + expiry are SQL functions invoked by `POST /api/internal/maintenance` (shared-secret header, rate-limited) from a free scheduler (⚠ Worker Cron Trigger or GitHub Actions — see `free-tier.md`). If no scheduler is available, the same sweep also runs opportunistically (at most once/hour, guarded by a DB advisory-style row lock) at the start of authenticated requests.
 
-### 3.4 Verification
-Server-authoritative; clients only *ask*. Full rules in `game-core/verification.ts` (M4); contract in the protocol doc.
-
-| Step type | Evidence | Checks (all server-side) |
+## 5. Features needing an alternative implementation (summary)
+| Feature | Why | Alternative |
 |---|---|---|
-| `geofence` | GPS fix | `accuracyM ≤ maxAccuracyM`; geodesic distance to target ≤ `radiusM` (PostGIS `ST_DWithin` or haversine in game-core); **dwell**: ≥ `minDwellSec` of consecutive in-radius fixes; **plausibility**: implied speed vs previous fix ≤ 12 m/s, no teleport |
-| `site_code` | Short code displayed at a physical, public placeholder marker | constant-time compare to salted hash in `private.step_secrets`; ≤ `maxAttempts` per user per step, then 10 min lockout |
-| `party_sync` | Fixes from N members | ≥ `minMembersPresent` members with fresh (≤ `windowSec`) accepted fixes inside `radiusM` of each other/target |
-| `narrative` | none | auto-advance on acknowledgement |
+| Always-on lobby | no verified free always-on WebSocket host | best-effort Render lobby; clients reconnect; app fully usable without it |
+| Continuous-position dwell check | verification moved out of Colyseus | two-fix challenge check-in |
+| Live `party_sync` | same | window of accepted check-ins |
+| Guest keeps same user id on upgrade | Better Auth deletes anonymous user on link | transactional progress transfer function |
+| Magic link in production | needs email sender + (likely) a domain | feature flag; Google OAuth + guest always available |
+| DB-side scheduled purge (`pg_cron`) | unverified on Neon Free | internal maintenance route + free scheduler |
+| Realtime scale-out (Redis) | single free instance | none; cap rooms/capacity |
+| Turnstile/Sentry | free terms unverified | per-IP rate limiting; structured logs |
 
-Outcomes: `accepted`, `rejected_distance|accuracy|dwell|code|suspicious`, `pending_review`. We do **not** hard-ban on one signal: suspicious patterns raise `reason_flags`, and repeated flags route to manual review. Responses give only a coarse distance band (`very_close/close/far`) so the API cannot be used as a distance oracle. **Raw coordinates are never written to the database** — only the band, accuracy bucket and flags (PRIV-2).
+## 6. Performance and mobile budgets (unchanged)
+Initial route ≤ 170 KB gzip JS; map/3D lazy; LCP ≤ 2.5 s on throttled 4G; GPS only on user action; lobby WebSocket ≤ 10 msgs/s/client; Workers 10 ms CPU budget tracked in CI via the dry-run + a load test (M0).
 
-GPS honesty: browser geolocation can be spoofed; the design assumes this and makes cheating *low value* (no money, no competitive ranking in v1) rather than pretending to be unspoofable.
-
-## 4. Cross-cutting
-
-- **Observability:** structured JSON logs with request/room id; never log coordinates, tokens or join codes. Sentry (errors, scrubbed) + Colyseus monitor behind admin auth. Metrics: room count, verification outcome mix, p95 message latency.
-- **Offline/poor network (Karachi reality):** the PWA caches the shell and quest text; map tiles for the pilot bounding box are cacheable; verification requests retry with idempotency keys (`runId+stepId+attemptNonce`).
-- **Deployment:** web on Vercel; realtime on a single-region Node host close to users (sticky, single process for MVP; Redis presence/driver only when scaling horizontally — M8); Supabase region nearest available (OQ-4).
-- **Environments:** `local` (Supabase CLI + `pnpm dev`), `staging` (placeholder content allowed via `allow_playtest_content`), `production` (flag permanently false until reviewed content exists).
-- **Accessibility & localisation:** English + Urdu (RTL) are first-class from M0: logical CSS properties, `dir` set per locale, no text in images. See UI doc.
-
-## 5. ADR log
-| # | Decision | Alternatives |
+## 7. ADR log
+| # | Decision | Alternatives rejected |
 |---|---|---|
-| 1 | Colyseus for realtime, authoritative verification | Supabase Realtime; custom ws |
-| 2 | Raw location never persisted; only bands/flags | Store trails for analytics (rejected, privacy) |
-| 3 | Guest = Supabase anonymous user (same uid on upgrade) | Custom guest tokens (extra auth surface) |
-| 4 | One run model for solo + party | Separate solo/party tables |
-| 5 | Zod contracts as the single source of truth | OpenAPI/ts-rest (heavier for a 2-service system) |
-| 6 | Placeholder content structurally unpublishable (DB CHECK + flag) | Convention only |
+| 1 | Colyseus for realtime, **no DB access** | Colyseus with DB writes (leak = data compromise) |
+| 2 | Raw coordinates never persisted | trails for analytics |
+| 3 | Self-hosted Better Auth (guest support) | Neon managed (no anonymous), Auth.js (no guest plugin evaluated) |
+| 4 | One run model for solo + party | separate tables |
+| 5 | Zod contracts as source of truth | OpenAPI |
+| 6 | Placeholder content structurally unpublishable | convention |
+| 7 | Drizzle + `withActor` is the only DB path; restricted role + RLS | service role/owner at runtime; PostgREST/Data API |
+| 8 | Privileged writes = `SECURITY DEFINER` functions | `BYPASSRLS` role; "system" claim in a setting |
+| 9 | Neon `-pooler` for runtime, direct for migrations | direct everywhere (connection exhaustion) |
+| 10 | Cloudflare Workers for web; Render free for Colyseus (best-effort) | Cloudflare for Colyseus (impossible); paid hosts (forbidden) |

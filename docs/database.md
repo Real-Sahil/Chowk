@@ -1,91 +1,66 @@
-# Chowk — Database
+# Chowk — Database (Neon PostgreSQL + Drizzle)
 
-Source of truth: [`supabase/migrations/20261113000000_init.sql`](../supabase/migrations/20261113000000_init.sql).
-It was applied to a clean PostgreSQL 16 and exercised with the assertions in `supabase/tests/rls_smoke.sql`
-(PostGIS was shimmed in that check; run against a real local Supabase in M1 before relying on geography columns).
-RLS policies are specified in [`security.md`](./security.md#5-row-level-security-model).
+Status: **access layer implemented and tested** (`packages/db`); **table schema is designed here and implemented in Prompt 3** as Drizzle migrations. The revision-1 Supabase migration was deleted (it depended on `auth.users`, `auth.uid()`, PostgREST roles and Supabase RPCs); its design intent is carried forward below.
+Quotas, sleep behaviour and pooling constraints: [`free-tier.md`](./free-tier.md). RLS model: [`security.md`](./security.md) §5.
 
-## Conventions
-- `uuid` PKs (`gen_random_uuid()`), `timestamptz` everywhere, snake_case, enums for closed sets.
-- `public` = exposed to PostgREST under RLS. `private` = helper functions, secrets, flags; **not** in the exposed schemas list.
-- **No raw coordinates about players are stored.** Only quest-target geometry (authored content) uses PostGIS.
-- Clients never write game state. Writers: service role (realtime server/jobs) and three security-definer RPCs.
+## 1. Connections
+| Purpose | Variable | Endpoint | Role | Used by |
+|---|---|---|---|---|
+| Runtime | `DATABASE_URL` | Neon **`-pooler`** host (PgBouncer, transaction mode) | `chowk_app` (RLS enforced) | Next.js server only |
+| Migrations / bootstrap / definer-function ownership | `DATABASE_URL_UNPOOLED` | Neon **direct** host | owner | `drizzle-kit`, `scripts/bootstrap-app-role.sh` — a developer or CI job; **never a deployed runtime** |
+| Tests | `DATABASE_URL` + `TEST_OWNER_URL` | throwaway local Postgres | `chowk_app` / superuser | `packages/db` tests |
 
-## Entity relationships
+Pooling rules (verified, see free-tier §1): no session `SET`, no `LISTEN/NOTIFY`, no SQL-level `PREPARE`, no session advisory locks, no `WITH HOLD` cursors. Identity binding uses `set_config(..., true)` inside the transaction. Runtime on Workers uses the `@neondatabase/serverless` **WebSocket `Pool`** (interactive transactions); Node processes use `pg`. Pool size `DB_POOL_MAX` default 5. Neon compute sleeps after 5 minutes idle: the first query after idle is slower — the API must tolerate it (timeouts ≥ 10 s, retry once on connection error).
 
+## 2. Access layer (implemented)
 ```
-auth.users 1─1 profiles
-auth.users 1─* consent_records
-districts 1─* locations 1─* quest_steps *─1 quests 1─* stamps
-quests 1─* quest_runs *─0..1 parties 1─* party_members *─1 auth.users
-quest_runs 1─* quest_run_members *─1 auth.users
-quest_runs 1─* quest_run_steps *─1 quest_steps
-quest_runs 1─* verification_attempts *─1 quest_steps
-auth.users 1─* user_stamps *─1 stamps
-auth.users 1─* reports            audit_log (standalone)
-private.step_secrets 1─1 quest_steps      private.app_flags (k/v)
+packages/db/src
+  env.ts      DbEnv (Zod): DATABASE_URL, DB_POOL_MAX; rejects neondb_owner; requires -pooler on Neon outside `local`
+  context.ts  bindActor(): set_config('app.user_id', $1, true) with UUID-validated bound param
+  guard.ts    assertUnprivilegedRole(): refuses superuser / bypassrls / createrole / createdb
+  adapter.ts  createNodeAdapter() / createNeonAdapter() -> DatabaseAdapter.withActor(actor, tx => ...)
+packages/db/sql/001_roles_and_context.sql   schema app, role chowk_app, app.current_user_id()
+packages/db/scripts/bootstrap-app-role.sh   creates login password out-of-band (psql variable)
+packages/db/scripts/with-test-db.sh         throwaway Postgres + vitest
 ```
+There is no exported raw pool and no `sql.raw`-with-variables policy: **every query runs inside `withActor`**.
 
-## Tables
+## 3. Entities (Prompt 3 implements as Drizzle schema + SQL migrations)
+Conventions: `uuid` PKs (`gen_random_uuid()`), `timestamptz`, snake_case, enums as Postgres enums or `CHECK`ed text, `created_at/updated_at` everywhere, `ON DELETE CASCADE` from `users` for personal data, **RLS `ENABLE`+`FORCE` and explicit grants on every table**.
 
-### Identity
-| Table | Purpose | Key columns / constraints |
-|---|---|---|
-| `profiles` | Public-ish player card | `user_id` PK→`auth.users` (cascade); `display_name` 2–24 chars; `avatar_key`; `share_coarse_location` **default false**; created by trigger `on_auth_user_created` (name `Guest-xxxxx`) |
-| `consent_records` | Append-only consent ledger | `kind` (terms, privacy, location_foreground, party_location_sharing, analytics), `granted`, `policy_version`; latest row per kind wins; index `(user_id, kind, recorded_at desc)` |
-
-Guest vs member is **not a column**: it is the JWT claim `is_anonymous` (single source of truth, upgrade flips it without a data change).
+### Identity (Better Auth tables + ours)
+- `user, session, account, verification` — created by Better Auth's Drizzle adapter (schema `public` or `auth`; read **only** by the auth module).
+- **`profiles`** `user_id` PK→user (cascade), `display_name` (2–24, CHECK), `avatar_key`, `role` enum(`player`,`moderator`,`admin`) default `player` (**not writable by `chowk_app`**), `status` enum(`active`,`suspended`,`deleted_pending`), `is_guest` (mirrors auth), `share_coarse_location` default **false**, **consent fields**: `terms_version`, `terms_accepted_at`, `privacy_version`, `privacy_accepted_at`, `location_consent_at`, `party_location_consent_at`, `analytics_consent` (default false), `last_seen_at`.
+- **`characters`** `id`, `user_id` FK, `name`, `appearance` jsonb (validated by Zod; whitelist keys/palette), `story` text (≤ 600), unique `(user_id)` for the primary character, `created_at`.
 
 ### World & content
-| Table | Purpose | Notes |
-|---|---|---|
-| `districts` | Named areas (pilot: one placeholder district for Saddar) | optional `boundary geography(Polygon)`; `provenance` |
-| `locations` | Points of interest used by steps | `geom geography(Point)` + GiST; `is_public_space` **CHECK true**; `reveal` (`always`/`on_step`); `provenance` |
-| `quests` | Quest header | `status` draft→playtest→published→retired; `provenance` placeholder/reviewed; party size bounds; `daylight_only`; `content_version`; review fields. **CHECK** placeholder ⇒ never `published`; **CHECK** published ⇒ reviewer + timestamp |
-| `quest_steps` | Ordered steps | `unique(quest_id, ordinal)`; `step_type`; `config jsonb` validated by `StepConfig` (contracts) at ingest and in CI |
-| `stamps` | Collectible reward per quest | `provenance` |
-| `private.step_secrets` | Salted hash of `site_code` answers | no client grant, RLS on with no policy |
-
-### Social
-| Table | Purpose | Notes |
-|---|---|---|
-| `parties` | A group | `leader_id`, `status` (forming/in_run/disbanded), `max_size` 2–6, `join_code` (6 chars, no ambiguous glyphs), `join_code_expires_at` (30 min). Partial unique index on live codes |
-| `party_members` | Membership history | PK `(party_id,user_id)`; `left_at` null = live; **partial unique index → one live party per user**; `ready` flag mirrors room state at run start |
+- **`places`** `id`, `slug` unique, `name`, `kind` enum(`food`,`maker`,`market`,`landmark`,`square`), `district` text (coarse), `geom` as `lat`/`lng` numeric with CHECK ranges (PostGIS is **not assumed on Neon Free** — ⚠ verify; geodesic math is done in `game-core`), **`geofence_radius_m`** CHECK 15–150, **`opening_hours`** jsonb (weekly schedule, validated), **`accessibility_notes`**, **`safety_notes`**, `is_public_space` **CHECK true**, `provenance` enum(`placeholder`,`reviewed`), `consent_basis` (for places tied to a real person/business: `none|owner_consent|public_landmark`), `active`.
+- **`quests`** `id`, `slug`, `title`, `summary`, `difficulty` enum(`easy`,`medium`,`hard`), `estimated_minutes`, `reward_xp`, `reward_badge_id`→badges, `available_from/until` + `time_window` (night market), `min_party_size/max_party_size` (1–6), `daylight_only`, `provenance`, `status` enum(`draft`,`playtest`,`published`,`retired`), `content_version`, `reviewed_by/at`. **CHECK:** placeholder ⇒ never `published`; published ⇒ reviewer + timestamp.
+- **`quest_steps`** `id`, `quest_id`, `ordinal` unique per quest, `place_id`, `title`, `clue`, `story_unlock`, **`verification_method`** enum(`gps`,`qr`,`photo`,`narrative`), `config` jsonb (Zod-validated per method), `qr_secret_hash` — column **not granted** to `chowk_app` (read inside definer functions only).
+- **`badges`** `id`, `slug`, `name`, `description`, `scope` enum(`individual`,`party`), `art_key`, `provenance`.
 
 ### Play
-| Table | Purpose | Notes |
-|---|---|---|
-| `quest_runs` | One play-through (solo or party) | `party_id` nullable; `content_version` pinned; `current_ordinal`; `expires_at` (12 h) |
-| `quest_run_members` | Participants snapshot | PK `(run_id,user_id)` |
-| `quest_run_steps` | Per-run step state | `status` locked/available/verifying/completed; `completed_by`; link to winning attempt |
-| `verification_attempts` | Audit of every verify request | **no lat/lng**; `outcome`, `distance_band`, `accuracy_m`, `reason_flags[]`; 30-day retention |
-| `user_stamps` | Earned collectibles | PK `(user_id,stamp_id)` — idempotent grants |
+- **`quest_completions`** `id`, `user_id`, `quest_id`, `party_id` nullable, `completed_at`, **unique `(user_id, quest_id)`** → exactly-once, `content_version`.
+- **`quest_step_progress`** `id`, `user_id`, `quest_id`, `step_id`, `status` enum(`locked`,`available`,`pending`,`completed`), `completed_at`, **unique `(user_id, step_id)`**. Party play: one row per member; shared progress = party view over members' rows.
+- **`verification_attempts`** `id`, `progress_id`, `user_id`, `method`, `outcome` enum(`accepted`,`rejected_*`,`pending_review`), `distance_band`, `accuracy_m`, `coarse_district`, `qr_jti`, **`attempt_nonce` — unique `(progress_id, attempt_nonce)` = replay protection**, **unique `qr_jti`** (single-use QR tokens), `created_at`. **No coordinates stored.** 30-day retention.
+- **`user_badges`** `user_id`, `badge_id`, `quest_id`, `party_id`, `issued_at`; **PK `(user_id, badge_id)`** → duplicate rewards impossible; issued only by `issue_badge()` definer function in the same transaction as the completion row.
 
-### Safety / ops
-| Table | Purpose |
-|---|---|
-| `reports` | Player reports (unsafe location, harassment, inaccurate content, cheating, other). Reporter can insert/read own only |
-| `audit_log` | Moderation + privileged actions (kick, manual review, content publish). Service-only |
+### Social & safety
+- **`parties`** `id`, `leader_id`, `status`, `max_size` CHECK 2–6, `join_code` (30-min TTL, unique among live), `created_at`.
+- **`party_members`** PK `(party_id,user_id)`, `role` enum(`leader`,`member`), `left_at`, `shares_location` default false (consent); **partial unique one-live-party-per-user**.
+- **`party_invitations`** `id`, `party_id`, `inviter_id`, `invitee_id`, `status` enum(`pending`,`accepted`,`rejected`,`expired`,`revoked`), `expires_at`, unique pending `(party_id, invitee_id)`; creation/accept functions reject if **either side blocked the other**.
+- **`blocks`** `blocker_id`, `blocked_id`, `created_at`, PK pair, CHECK `blocker_id <> blocked_id`. (Mute is client/room-local state + stored list `mutes` if persistence is wanted.)
+- **`reports`** `id`, `reporter_id`, `subject_user_id?`, `subject_party_id?`, `subject_place_id?`, `kind` enum(`harassment`,`impersonation`,`spam`,`safety`,`inappropriate_content`,`inaccurate_content`,`cheating`,`other`), `detail` ≤ 500, `status` enum(`open`,`triaged`,`closed`), `created_at`.
+- **`submissions`** nominations: `id`, `submitter_id`, `kind` enum(`person`,`place`,`business`,`story`,`quest_idea`), `title`, `body`, `subject_consent` enum(`not_applicable`,`obtained`,`pending`,`refused`) — **CHECK: a `person` submission cannot be approved/published unless `subject_consent='obtained'`**, `contains_private_address` flag set by moderators (such submissions cannot be published), `status` enum(`pending`,`approved`,`rejected`), `reviewed_by/at`.
+- **`photo_reviews`** `id`, `attempt_id`, `owner_id`, `storage_key` (private), `status` enum(`pending`,`approved`,`rejected`), `reviewer_id`, `reviewed_at`, `reason`, `published` boolean default **false** (owner opt-in required before any visibility beyond moderators).
+- **`moderation_actions`** append-only: `id`, `actor_id`, `action` enum(`warn`,`suspend`,`unsuspend`,`approve`,`reject`,`remove_content`,`role_change`), `target_type`, `target_id`, `reason`, `created_at`. UPDATE/DELETE revoked from every runtime role.
+- `audit_log` — append-only privileged-action trail (no PII payloads).
 
-## Functions
-| Function | Schema | Kind | Purpose |
-|---|---|---|---|
-| `is_anonymous()` | private | helper | reads JWT claim |
-| `is_party_member(uuid)`, `shares_party_with(uuid)`, `is_run_member(uuid)` | private | security definer helpers | RLS predicates without recursive policy lookups |
-| `quest_visible(status)` | private | helper | publication gate incl. `allow_playtest_content` flag |
-| `location_revealed(uuid)` | private | helper | reveal policy for target locations |
-| `create_party(size)`, `join_party(code)`, `leave_party(party)` | public | RPC (authenticated only) | the only client-callable party writers; handle leader promotion/disband |
-| `handle_new_user()` | private | trigger | creates `profiles` row |
-| `purge_expired()` | private | job | retention sweep; scheduled with `pg_cron` in M1 |
+## 4. Security-definer function inventory (Prompt 3–7)
+`transfer_guest_progress`, `record_verification` (consumes nonce/QR jti, advances progress), `issue_badge` (atomic, idempotent), `create_party / join_party / leave_party / invite / respond_invitation`, `block_user / unblock_user`, `moderate_*` (admin-gated inside), `maintenance_purge`, `delete_user_data`. Each: owner = migrator, `SET search_path = ''`, `REVOKE ALL FROM PUBLIC`, `GRANT EXECUTE TO chowk_app`, validates `app.current_user_id()` and arguments.
 
-## Indexing & performance
-FK-side indexes on every run/member lookup; GiST on `locations.geom`; `verification_attempts(created_at)` for retention; partial unique indexes double as constraints. Expected pilot volume is tiny (hundreds of concurrent players) — no partitioning, no materialised views until measured.
+## 5. Retention
+Raw GPS: never persisted. `verification_attempts`: 30 days. Guest accounts: 30 days inactivity. Expired invitations/parties: swept. `reports`/`moderation_actions`/`audit_log`: 12 months (reports anonymised after). Photos: deleted with the account; rejected photos purged after 14 days. Neon Free storage cap is 1 GB (≥0.5 GB assumed) — retention is also a **capacity** requirement; a size monitor alerts at 70 %.
 
-## Content ingest
-`content/placeholder/*.json` → validated by `QuestContentFile` (contracts) → `scripts/seed-content` (M2) upserts `locations`, `quests`, `quest_steps` as `provenance='placeholder'`, `status='playtest'`. Site-code secrets are generated at seed time and printed once for the dev; never committed.
-
-## Deferred (not in this schema on purpose)
-Chat/messages (SAFE-6), friends graph, leaderboards, payments, photo evidence, push tokens, background location. Each needs a privacy review before a table exists.
-
-## Migration policy
-Forward-only timestamped migrations; every migration ships with an RLS test; `supabase db reset` + smoke suite in CI; generated types (`supabase gen types`) committed to `packages/db/src/database.types.ts` (M1).
+## 6. Migration policy
+Drizzle Kit generates SQL; **hand-written SQL migrations** carry RLS policies, grants and definer functions (Drizzle's schema DSL does not model them all). Applied with the **direct** URL by a developer or CI job, never at app start. Forward-only; each migration ships with RLS tests on real Postgres (CI service container) and, before release, on a **Neon branch** (free: 10 branches/project).

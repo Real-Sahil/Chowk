@@ -10,8 +10,10 @@ Requirement IDs (SAFE-n, PRIV-n, AUTH-n, CONTENT-n, ABUSE-n) are referenced from
 | Curious/abusive player | Find other players' real-time locations | PRIV-1/3: no precise location ever leaves the server; coarse cells to party only, opt-in |
 | Stalker via party codes | Join strangers' parties | Short-lived, expiring, uniform-error codes; rate limits; leader kick; reports |
 | Cheater | Fake GPS to finish quests | Server-side verification, plausibility, dwell, site codes; low reward value |
-| Scraper | Read quest locations/answers | RLS reveal policy; code hashes in `private` schema |
-| Compromised client bundle | Escalate to service role | Service-role key only on realtime/jobs; bundle grep in CI |
+| Scraper | Read quest locations/answers | RLS reveal policy; code/QR secrets only in a table the app role cannot SELECT |
+| Compromised client bundle | Reach privileged DB access | No privileged DB credential exists in any browser or realtime bundle; runtime role is RLS-restricted; bundle scan in CI |
+| Compromised realtime host (free tier, shared) | Pivot to data | Realtime holds **no DB credentials**, only a public verification key; cannot read/write user data |
+| Leaked owner/migrator URL | Bypass RLS | Owner URL (`DATABASE_URL_UNPOOLED`) exists only in the developer's/CI migration shell; runtime fails closed if it connects as a privileged role |
 | Malicious WS client | Flood, malformed frames | Zod validation per message, per-type rate limits, payload caps |
 | Content author error | Ship a real person/business/story by accident | CONTENT-1 DB guard, review gate |
 
@@ -32,41 +34,64 @@ Requirement IDs (SAFE-n, PRIV-n, AUTH-n, CONTENT-n, ABUSE-n) are referenced from
 - **PRIV-3** Party members may see each other as a **grid cell** (`CoarseCell`, ~150 m, fixed server-side, jittered per room) — only if both the sharer opted in (`profiles.share_coarse_location`, default **false**) and a `party_location_sharing` consent is on record. Never to non-party users. Never historical.
 - **PRIV-4** Consent ledger (`consent_records`, append-only): terms, privacy, foreground location, party sharing, analytics. Location permission is requested **just-in-time** with an explanation screen, foreground only; no background location, ever.
 - **PRIV-5** Data minimisation: no phone number, real name, contacts, photos or precise device identifiers collected. Email only if the guest upgrades.
-- **PRIV-6** Right to delete: self-serve account deletion cascades all user rows. Guests auto-purge after 30 days inactivity.
+- **PRIV-6** Right to delete: self-serve account deletion cascades all user rows and deletes the user's stored objects. Guests auto-purge after 30 days inactivity.
 - **PRIV-7** Analytics (if any) off by default, no location, no join codes, IDs hashed; consent-gated.
 - **PRIV-8** Age: the minimum age and any parental-consent flow are a **legal decision** (OQ-1). Until resolved, ship as 18+ only in staging and do not target minors. No data is collected that would be incompatible with a later under-18 tightening.
 
 ## 4. Authentication & session security (AUTH)
 
-- **AUTH-1** Supabase Auth only. Anonymous sign-in protected by Cloudflare Turnstile and Supabase rate limits.
-- **AUTH-2** Access tokens ≤ 1 h; refresh rotation on; reuse detection on.
-- **AUTH-3** Colyseus `onAuth` verifies JWT via JWKS (`jose`), checks `exp`, `aud`, `iss`; rejects missing/mismatched `protocol`. Room join additionally checks DB membership of `partyId` (service role read) — a valid JWT alone is not enough.
-- **AUTH-4** Cookies (if SSR session cookies are used) `HttpOnly; Secure; SameSite=Lax`. CSRF: state-changing route handlers require same-origin + a custom header; server actions use Next's built-in checks.
-- **AUTH-5** No secrets in `NEXT_PUBLIC_*`. Only the Supabase URL + anon key + public hosts are public.
+- **AUTH-1** Self-hosted **Better Auth** in the Next.js server (Google OAuth, magic link when a free sender exists, anonymous guest). No client-side token handling: sessions are **server-stored**, referenced by an `HttpOnly; Secure; SameSite=Lax` cookie.
+- **AUTH-2** Session lifetime short for guests (idle expiry), rotated on sign-in/link; sign-out revokes server-side; account deletion revokes all sessions.
+- **AUTH-3** Realtime: browser obtains a **join ticket** (`POST /api/realtime/ticket`): Ed25519-signed, `aud` (`lobby`/`party`), `exp ≤ 60 s`, `jti`, carries `sub`, `guest`, and the user's block list. Colyseus verifies with the **public key only**; rejects wrong `aud`, expired, replayed `jti` (in-memory cache for ticket lifetime), mismatched protocol.
+- **AUTH-4** CSRF: state-changing routes require same-origin (`Origin` check) + `SameSite=Lax`; server actions use Next's built-in protection.
+- **AUTH-5** Secrets only in the host secret store: `BETTER_AUTH_SECRET`, OAuth client secret, ticket **private** key, storage secrets. Nothing secret is `NEXT_PUBLIC_*`.
+- **AUTH-6** Guest→member linking is a single DB transaction (`transfer_guest_progress`); conflicts resolved deterministically; idempotent; audited without PII.
+- **AUTH-7** Bot/abuse: per-IP and per-account rate limits on sign-in, guest creation, ticket issuance, invitation and verification routes (Workers-side limiter; Turnstile optional once its free terms are verified).
 
-## 5. Row-Level Security model
+## 5. Database access control (Neon) — roles, RLS, identity propagation
 
-RLS is enabled on **every** table in `public` and `private`. Grants start from `REVOKE ALL` then add the minimum (see migration). Clients cannot INSERT/UPDATE/DELETE game state at all.
+### 5.1 Roles
+| Role | Used by | Privileges | Credential lives in |
+|---|---|---|---|
+| owner / migrator (`neondb_owner` by default) | Drizzle migrations, bootstrap, `SECURITY DEFINER` function ownership | DDL, **bypasses RLS** | `DATABASE_URL_UNPOOLED` — developer shell / CI migration job **only**. Never in Workers, Render or any runtime |
+| `chowk_app` | Next.js server (all DB access) | `LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE`; table grants **per table, least privilege**; no default privileges | `DATABASE_URL` (pooled endpoint) in the Workers secret store |
+| *(none)* realtime | — | Colyseus has **no** DB role | — |
 
-| Table | Client can | Policy |
+- **DB-3 startup guard:** `createNodeAdapter/createNeonAdapter` query `pg_roles` for `current_user` and **refuse to start** if superuser/bypassrls/createrole/createdb (tested: owner credential rejected). `loadDbEnv` also rejects `neondb_owner` and (outside `local`) a non-`-pooler` Neon host.
+- **DB-4** Every table in `public` has `ENABLE` **and `FORCE`** row level security and explicit grants beside its policies; `REVOKE ALL ON SCHEMA public FROM PUBLIC`.
+
+### 5.2 Identity propagation (user → transaction → policy)
+`DatabaseAdapter.withActor(actor, fn)`:
+1. opens a single transaction;
+2. `select set_config('app.user_id', $1, true)` — **transaction-local**, bound parameter, UUID validated first (`UserId.parse`);
+3. runs `fn`; rollback on throw;
+4. policies use `app.current_user_id()` (returns `NULL` for none/empty).
+
+Why this is safe on Neon: the pooler is PgBouncer in **transaction mode**; session-level `SET` is unsupported and would leak across clients; `SET LOCAL`/`set_config(…, true)` is supported and resets on COMMIT/ROLLBACK. **Plain `SET app.user_id` is banned** (lint rule + test shows a stray session-level `SET` cannot override the next transaction's binding).
+
+**Admin / moderator:** never passed in. Policies use `exists (select 1 from profiles p where p.user_id = app.current_user_id() and p.role in ('admin','moderator'))`; `profiles.role` is not updatable by `chowk_app` (no grant on the column) — only by a `SECURITY DEFINER` function that itself requires an existing admin. Server routes **additionally** check role before admin work (defence in depth, DB is the backstop).
+
+**Privileged operations** (issue badge, record verification outcome, consume QR token, transfer guest progress, moderation actions): `SECURITY DEFINER` functions owned by the migrator, `SET search_path = ''`, `REVOKE EXECUTE FROM PUBLIC`, `GRANT EXECUTE TO chowk_app`; they validate arguments and the caller (`app.current_user_id()`) internally and are atomic (single transaction, unique constraints for exactly-once).
+
+### 5.3 Table-level policy matrix (implemented in Prompt 3)
+| Table(s) | `chowk_app` as user can | Notes |
 |---|---|---|
-| `profiles` | select own + live party-mates; update `display_name, avatar_key, share_coarse_location` of own row | `user_id = auth.uid() OR private.shares_party_with(user_id)`; column-level UPDATE grant |
-| `consent_records` | select/insert own (append-only) | `user_id = auth.uid()`; no update/delete grant |
-| `districts` | select active | `active` |
-| `locations` | select if active **and revealed** | `private.location_revealed(id)`: `reveal='always'` OR location is the target of a step that is available/verifying/completed in an active run you belong to |
-| `quests`, `quest_steps`, `stamps` | select if visible | `private.quest_visible(status)`: `published`, or `playtest` only when `private.app_flags.allow_playtest_content` is true |
-| `parties`, `party_members` | select if member | `private.is_party_member(party_id)`; writes **only** via `create_party/join_party/leave_party` RPCs (security definer) or service role |
-| `quest_runs`, `quest_run_members`, `quest_run_steps` | select if run member | `private.is_run_member(run_id)`; writes service role only |
-| `verification_attempts`, `user_stamps` | select own | `user_id = auth.uid()` |
-| `reports` | insert own (status `open`), select own | `reporter_id = auth.uid()` |
-| `audit_log`, `private.*` | nothing | RLS on, no policies, no grants |
+| `profiles` | read own + live party-mates (name/avatar columns via view) · update own non-role columns | `role`, `status` not writable |
+| `characters` | CRUD own | |
+| `places`, `quests`, `quest_steps`, `badges` | read when published (placeholder content only visible when `ALLOW_PLAYTEST_CONTENT`, never in production) | writes only through admin functions |
+| `quest_completions`, `quest_step_progress`, `user_badges` | read own / party-shared | **no direct INSERT/UPDATE** — via definer functions |
+| `parties`, `party_members`, `party_invitations` | members read; invitee reads own invitations | writes via functions; **blocks enforced both directions** |
+| `blocks` | CRUD own rows | |
+| `reports` | insert own, read own | moderators read all (DB-derived role) |
+| `submissions` | insert/read own | moderators review |
+| `verification_attempts` | read own | written by definer function only; no coordinates |
+| `photo_reviews`, `moderation_actions`, `audit_log` | none (moderators via functions) | append-only for actions |
 
-Implementation notes (all in the migration):
-- Helper functions live in the un-exposed `private` schema, are `SECURITY DEFINER` with `search_path = ''`, and wrap `auth.uid()` in `(select …)` so the planner caches it.
-- RPCs use uniform errors (`cannot join`) to prevent code probing; `join_party` locks the row (`FOR UPDATE`) to prevent over-filling races.
-- **Guests** hold the `authenticated` role with `is_anonymous=true` (`private.is_anonymous()`); they can play and join parties. Restrictive policies are added per feature where a guest must be limited (e.g. future public leaderboards, content submission). A guest-vs-member test case is part of the pgTAP suite.
-- `supabase/tests/rls_smoke.sql` encodes the cross-user isolation assertions; M1 converts it to pgTAP and runs in CI on every migration.
-- **Service role** (realtime server, jobs) bypasses RLS → all its writes go through `packages/db/server` functions that take typed arguments, check preconditions explicitly, and write `audit_log` for moderation-relevant actions. No raw SQL strings built from client input anywhere.
+### 5.4 Honest limits of RLS here
+- RLS protects against application bugs (IDOR, forgotten filters), cross-user leakage and tampering through any future direct-DB exposure.
+- It does **not** protect against an attacker who can run **arbitrary SQL as `chowk_app`** (they can set `app.user_id` themselves). Mitigations: parameterised Drizzle queries only (lint bans `sql.raw` with variables), no SQL-over-HTTP endpoint, restricted grants, definer functions for sensitive writes, startup role guard, no raw pool exported.
+- Privilege escalation via the app role is limited by column grants (no `role` update), no DDL, no `CREATE` on `public`.
+- Test coverage today: `packages/db/test/rls-context.test.ts` — 15 tests on a real PostgreSQL 16 (isolation, WITH CHECK, no-identity, no leakage on a reused connection, rollback cleanup, injection input, DB-derived admin, no self-promotion, 40-way concurrency, owner-credential refusal, env guards). **Not yet tested through a real PgBouncer or Neon** (needs a Neon project — planned in Prompt 3's CI job).
 
 ## 6. Application hardening (ABUSE)
 
@@ -74,8 +99,8 @@ Implementation notes (all in the migration):
 - **ABUSE-2** Rate limits: per-message table in `contracts/realtime.ts` (`C2S_RATE_LIMITS`); join-code attempts: 5 / 10 min per user and per IP at the edge, exponential backoff.
 - **ABUSE-3** Idempotency: verification requests carry `(runId, stepId)`; server serialises per run (one in-flight verify per step) so double-taps can't double-advance.
 - **ABUSE-4** Site-code brute force: ≤ `maxAttempts` per user/step then lockout; codes ≥ 4 chars from a non-guessable alphabet; stored salted+hashed.
-- **ABUSE-5** Security headers on web: strict CSP (self + Supabase + tile host + wss), `frame-ancestors 'none'`, `Referrer-Policy: strict-origin-when-cross-origin`, `Permissions-Policy: geolocation=(self), camera=(), microphone=()`.
-- **ABUSE-6** CORS on realtime: allow-list of web origins only. WS origin check on upgrade.
+- **ABUSE-5** Security headers on web: strict CSP (self + tile host + the realtime wss origin; no third-party script origins), `frame-ancestors 'none'`, `Referrer-Policy: strict-origin-when-cross-origin`, `Permissions-Policy: geolocation=(self), camera=(), microphone=()`.
+- **ABUSE-6** CORS on realtime: allow-list of web origins only. WS origin check on upgrade. Uploads: ≤ 5 MB, JPEG/PNG/WebP by magic bytes, EXIF/GPS stripped, server-generated keys, private objects, signed reads ≤ 15 min, never auto-published (moderation queue).
 - **ABUSE-7** Dependency hygiene: lockfile committed, `pnpm audit` + Dependabot in CI, `pnpm install --frozen-lockfile`, no postinstall scripts allowed except an allow-list.
 - **ABUSE-8** Secrets: only in host secret stores; `.env.example` contains names only; secret-scanning on push.
 
@@ -91,11 +116,11 @@ Implementation notes (all in the migration):
 | Data | Retention |
 |---|---|
 | Raw GPS fixes | memory only, discarded after the verification decision / 60 s plausibility window |
-| `verification_attempts` | 30 days (`private.purge_expired`) |
+| `verification_attempts` | 30 days (`maintenance_purge()` SQL function) |
 | Guest accounts | deleted after 30 days of inactivity |
 | Expired party codes / parties | disbanded after expiry; membership rows deleted with party |
 | `reports` | 12 months, then anonymised (subject refs nulled) |
 | `audit_log` | 12 months |
 
 ## 9. Security test plan
-pgTAP RLS suite (per table × {owner, party-mate, outsider, guest, anon}); contract fuzzing of `C2S` schemas; Playwright tests for permission-denied geolocation, token-expiry reconnect, and party-code probing; bundle scan for service-role key; ZAP baseline against staging before any public pilot.
+RLS suite on real PostgreSQL (per table × {owner, party-mate, outsider, guest, anon}; started — see §5.4); contract fuzzing of `C2S` schemas; Playwright tests for permission-denied geolocation, token-expiry reconnect, and party-code probing; bundle scan proving no `DATABASE_URL`/owner URL/private keys reach any client or realtime bundle; ZAP baseline against staging before any public pilot.

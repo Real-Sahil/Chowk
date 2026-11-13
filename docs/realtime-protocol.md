@@ -1,6 +1,6 @@
 # Chowk — Realtime Protocol (Colyseus)
 
-Contract source of truth: [`packages/contracts/src/realtime.ts`](../packages/contracts/src/realtime.ts) (Zod, typechecks today).
+Contract source of truth: [`packages/contracts/src/realtime.ts`](../packages/contracts/src/realtime.ts) (Zod, typechecks today). **Revision 2:** this protocol covers lobby/party presence only. Run control and verification are HTTP (`packages/contracts/src/api.ts`) handled by Next.js; Colyseus has no database access. Hosting caveat: the realtime server runs on a free host that **sleeps and restarts** (see `free-tier.md` §4) — all state here is ephemeral.
 Protocol version: **1** (`PROTOCOL_VERSION`). Any breaking change bumps it; the server rejects mismatched clients with `protocol_mismatch`.
 
 ## 1. Rooms
@@ -13,11 +13,11 @@ There is deliberately **no global/district room** in v1: no stranger-visible pre
 
 ## 2. Connection & auth
 ```ts
-client.joinById(partyRoomId, { protocol: 1, accessToken, partyId })   // PartyJoinOptions
+client.joinById(partyRoomId, { protocol: 1, joinTicket, partyId })   // PartyJoinOptions
 ```
-`onAuth` (server): validate options with `PartyJoinOptions` → verify JWT (JWKS, `iss`, `aud`, `exp`) → confirm `sub` is a live member of `partyId` (service-role read) → attach `{userId, isAnonymous}` to the client. Failure → close code 4401 (unauthorized) / 4403 (not a member) / 4426 (protocol mismatch). Token is never placed in room state or logs.
+`onAuth` (server): validate options with `PartyJoinOptions` → verify the **join ticket** (Ed25519 signature with the web app's *public* key, `aud`, `exp ≤ 60 s`, unused `jti`) → attach `{userId, isGuest, blocked[]}` from the ticket claims. **No database lookup** (the room has no DB access); party membership/blocks are asserted inside the signed ticket. Failure → close code 4401 (unauthorized) / 4403 / 4426 (protocol mismatch). The ticket is never placed in room state or logs.
 
-**Reconnection:** `allowReconnection(client, 60)`. On drop the member is marked `connected:false` but keeps their seat; coarse-cell sharing stops immediately. Clients refresh the token then rejoin.
+**Reconnection:** `allowReconnection(client, 60)`. On drop the member is marked `connected:false`; coarse-cell sharing stops immediately. Clients fetch a new ticket then rejoin. **If the host restarted or slept, rooms are gone**: the client re-creates/rejoins and the roster rebuilds from the next tickets (membership truth is in Postgres, served by the web app).
 
 ## 3. Synced state (Colyseus schema — kept deliberately tiny)
 ```
@@ -41,10 +41,7 @@ All envelopes `{ type, payload }`. Payload validated by `C2S[type]`; invalid →
 | `party.ready` | `{ready}` | member | 5 / 10 s | toggles readiness |
 | `party.kick` | `{userId}` | leader | 3 / 10 s | removes member, closes their socket, audit-logged |
 | `party.leave` | `{}` | member | 2 / 10 s | calls leave RPC; handles leader promotion |
-| `run.start` | `{questId}` | leader | 2 / 30 s | requires all members ready & size within quest bounds & party `forming`; creates run in one txn |
-| `step.verify.geofence` | `{runId, stepId, fix}` | member | 6 / 30 s | geofence / party_sync verification (see §6) |
-| `step.verify.code` | `{runId, stepId, code}` | member | 5 / 60 s | site-code verification |
-| `run.abandon` | `{runId}` | leader (party) / owner (solo) | 2 / 30 s | ends run |
+| `run.changed` | `{runId}` | member | 6 / 30 s | **untrusted hint** relayed to other members after the sender's HTTP verification succeeded; receivers must refetch from the API |
 | `ping.emote` | `{emote}` | member | 4 / 10 s | relays one of `wave|here|wait|go|help` — the only member-to-member communication |
 
 Rate limits live in `C2S_RATE_LIMITS`; exceeding returns `server.error{rate_limited}` (no strike for the first breach).
@@ -56,36 +53,23 @@ Rate limits live in `C2S_RATE_LIMITS`; exceeding returns `server.error{rate_limi
 | `party.member.cell` | `{userId, cell: CoarseCell\|null}` | `null` = stopped sharing. Only to *other* members; never to the owner, never persisted |
 | `party.member.emote` | `{userId, emote}` | |
 | `party.kicked` | `{reason}` | followed by close |
-| `run.started` | `{runId, questId}` | |
-| `step.verification` | `{runId, stepId, outcome, hint?, attemptsRemaining?}` | response to the requester only. `hint` is a coarse band, never metres |
-| `run.step.advanced` | `{runId, completedStepId, nextStepId\|null}` | broadcast to run members |
-| `run.completed` / `run.abandoned` | `{runId}` | broadcast |
+| `run.changed` | `{runId, by}` | relayed hint; never carries progress data |
 | `server.error` | `{code, message, ref?}` | `ErrorCode` enum; `message` is user-safe; `ref` correlates with server logs |
 | `server.heartbeat` | `{serverTs}` | |
 
-## 6. Verification handling (server)
-1. Validate payload; confirm sender is a member of the run and the step is `available` (else `step_not_available`).
-2. Take a per-run lock; mark step `verifying` (prevents double-advance, ABUSE-3).
-3. Run `game-core` verifier with injected clock: accuracy gate → distance → dwell (from ring buffer) → plausibility (speed/teleport) [→ party quorum for `party_sync`].
-4. Write one `verification_attempts` row (no coordinates).
-5. Accepted → transaction: step completed, next step `available`, run advanced/completed, stamps on completion. Then broadcast.
-6. Rejected → step back to `available`; respond with outcome + band.
-Idempotency: repeating a request for an already-completed step returns `accepted` without side effects.
+## 6. Verification (moved out of Colyseus)
+Verification is `POST /api/runs/:id/steps/:id/verify` in Next.js (`VerifyGeofenceInput`/`VerifyCodeInput` → `VerificationResult`, see `architecture.md` §4.4). Replay protection by `attemptNonce`, single-use QR `jti`; no coordinates stored. This room only relays the `run.changed` hint.
 
 ## 7. Error codes
-`bad_request`, `unauthorized`, `forbidden`, `rate_limited`, `not_in_party`, `not_leader`, `run_not_active`, `step_not_available`, `verification_failed`, `protocol_mismatch`, `internal`. Close codes: 4401, 4403, 4426, 4429 (strikes).
+`bad_request`, `unauthorized`, `forbidden`, `rate_limited`, `not_in_party`, `not_leader`, `protocol_mismatch`, `internal`. Close codes: 4401, 4403, 4426, 4429 (strikes).
 
 ## 8. Example exchange
 ```jsonc
-// C → S
-{ "type": "step.verify.geofence",
-  "payload": { "runId": "…", "stepId": "…", "fix": { "lat": 0.0, "lng": 0.0, "accuracyM": 12, "clientTs": 1790000000000 } } }
-// S → C (requester only)
-{ "type": "step.verification", "payload": { "runId": "…", "stepId": "…", "outcome": "rejected_distance", "hint": "close" } }
-// later S → party
-{ "type": "run.step.advanced", "payload": { "runId": "…", "completedStepId": "…", "nextStepId": "…" } }
+// C → S (after a successful HTTP verification)
+{ "type": "run.changed", "payload": { "runId": "…" } }
+// S → other members
+{ "type": "run.changed", "payload": { "runId": "…", "by": "…" } }
 ```
-(Coordinates above are zero placeholders.)
 
 ## 9. Testing
 Contract tests round-trip every schema with valid/invalid fixtures; a headless client harness (colyseus.js + vitest) drives full scenarios: join → ready → start → verify (accepted/rejected/replay) → reconnect → kick; load test 200 rooms × 4 clients at the update cap on a 1-vCPU instance to confirm the budget.

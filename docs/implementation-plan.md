@@ -1,74 +1,53 @@
 # Chowk — Implementation Plan
 
-Principle: ship the thinnest vertical slice that proves the loop (**guest → map → quest → verify a step**) on a real phone, then widen. Security and privacy gates are part of each milestone's definition of done, not a later phase.
+Principle: ship the thinnest vertical slice that proves the loop (**guest → lobby → quest → verify a step**) on a real phone, then widen. Security and privacy gates are part of each milestone's definition of done, not a later phase.
 
-## Current state (M-1, this change)
-Done: monorepo skeleton (pnpm workspaces, strict TS base), `packages/contracts` (Zod, typechecks), initial Postgres migration with RLS + RPCs (applied and smoke-tested on PG16), docs, `.env.example`.
-Not started: every app, `game-core`, `ui`, `map`, `scene3d`, CI, content.
-Existing code preserved: the repository contained only a one-line `README.md`, which was replaced by the full README.
+## Current state
+**Done and verified (evidence in repo):**
+- Revision-2 architecture: Supabase removed completely (code, config, docs, migrations). `grep -ri supabase` over tracked files returns only the "what changed" notes.
+- `packages/contracts` (Zod; HTTP verification contracts moved to `api.ts`; Colyseus contract slimmed to lobby/party), typechecks.
+- `packages/ports`: `DatabaseAdapter`, `AuthAdapter`, `RealtimeTicketAdapter`, `StorageAdapter`.
+- `packages/db`: env validation, RLS identity binding, privileged-role guard, Node + Neon drivers. **15/15 tests pass on a real PostgreSQL 16** (not mocks). *Not yet exercised against Neon itself or a real PgBouncer.*
+- `packages/storage`: local-fs adapter, **3/3 tests pass**.
+- `docs/free-tier.md`: provider quotas verified from official docs on 2026-11-13, conflicts and unverified items listed.
+**Not started:** all apps, schema migrations, auth, UI, realtime, game-core, CI.
 
-## Milestones
+## Milestones (re-sequenced to the revision-2 prompts)
 
-### M0 — Foundations (≈ 1 week)
-- `apps/web`: Next.js App Router + TS strict, Tailwind, shadcn/ui init in `packages/ui`, PWA manifest + service worker shell, `next-intl` (en/ur, RTL).
-- `packages/config`: eslint (incl. `no-restricted-imports` per boundary rules), `dependency-cruiser` config, env validation (Zod) for web/realtime.
-- CI (GitHub Actions): `pnpm install --frozen-lockfile`, typecheck, lint, unit, boundary check, bundle-size budget, secret scan.
-- Playwright scaffold with geolocation-mocked context and a smoke test.
-- **DoD:** blank PWA installable, passes budget, CI green, service-role-key bundle scan wired.
+### P3 — Database, auth, foundation
+- Drizzle schema + hand-written SQL (RLS, grants, definer functions) for the 17 tables in `database.md` §3; seed fictional Saddar content (3 quests, all `PLACEHOLDER`).
+- Better Auth in `apps/web`: Google OAuth, guest, magic link (flagged), account deletion, `transfer_guest_progress`.
+- **Spikes (gate decisions):** (a) Neon project: run the RLS suite through the real `-pooler` endpoint; measure cold-start; (b) Better Auth anonymous plugin email requirement; (c) `wrangler deploy --dry-run` bundle size + CPU test; (d) Neon Object Storage credentials for apps vs Cloudinary private delivery.
+- **DoD:** migrations apply to a clean Neon branch; RLS tests per table (owner, party-mate, outsider, guest, anon, moderator); no mock DB.
 
-### M1 — Auth, consent, data layer (≈ 1.5 weeks)
-- Supabase local project; apply migration; `supabase gen types` → `packages/db`.
-- pgTAP RLS suite (convert `rls_smoke.sql`; add guest/anon/outsider matrix); `pg_cron` jobs for `purge_expired` and guest purge.
-- Guest sign-in (Turnstile), email upgrade, profile, consent ledger UI, account deletion/export, legal page stubs.
-- **DoD:** guest→member upgrade keeps uid; RLS suite green in CI; delete-account cascades verified.
+### P4 — Frontend and profiles (Next.js, Tailwind, shadcn, Zustand, R3F)
+Landing, auth, guest onboarding, profile/avatar/character, guidelines, safety, settings/deletion, bottom nav (Home · Explore · Play · Parties · Profile) with lobby as primary. WCAG 2.2 AA, keyboard, loading/empty/error states. **Every control wired to real server behaviour.**
 
-### M2 — Map & quest browsing with placeholder content (≈ 1.5 weeks)
-- `packages/map` (MapLibre, lazy), pilot centre from env, GPS status chip, location rationale + denied states.
-- Content pipeline: `QuestContentFile` validator + linter (`[PLACEHOLDER]` prefix, no-real-names heuristic list) + seed script; 1–2 fictional quests (see `content/placeholder/`).
-- Routes: `/map`, `/quests`, `/quests/[slug]`, onboarding safety/location, settings.
-- **DoD:** on a mid-tier Android over throttled 4G, LCP ≤ 2.5 s, map chunk lazy, offline shell works; placeholder quests visible in staging only.
+### P5 — Colyseus lobby (critical)
+`lobby` room, 40 players, server-authoritative movement, interpolation, emotes, AFK 3 min, reconnection, proximity chat (15 s expiry), block/mute, profanity filter, rate limits. **Two-real-client integration test.** Deployed to Render free as best-effort; wake-up UX.
 
-### M3 — Party & realtime lobby (≈ 2 weeks)
-- `apps/realtime` Colyseus: `onAuth` (JWKS), `PartyRoom` (roster, ready, kick, leave, emotes, coarse-cell sharing opt-in), reconnection, rate limiter + strikes, structured logs.
-- `packages/db/server` typed service-role functions; `/party/*` UI; report sheet.
-- **DoD:** headless harness scenarios pass; 200 rooms × 4 clients load test within CPU budget; no coordinates in logs (test asserts).
+### P6 — Quests, map, verification
+MapLibre + OpenFreeMap; three placeholder trails; GPS (two-fix check-in), signed single-use QR, photo upload to private storage + moderation queue; all verification in Next.js server routes.
 
-### M4 — Runs & verification (≈ 2 weeks)
-- `game-core`: geodesic math, geofence+dwell+plausibility verifier, quest state machine, party_sync quorum, site-code check — 100 % unit tested with injected clock.
-- Server: `run.start`, verify handlers, transactions, idempotency, `verification_attempts`, audit log.
-- UI: run HUD, verify button states, site-code entry, sync meter.
-- **DoD:** field test at a **synthetic** location with 3 phones; spoof scenarios (teleport, low accuracy, replay) rejected; double-tap safe.
+### P7 — Badges, parties, social, admin-lite
+Atomic reward issuance, party rewards, invitations (block-aware), reports/blocks/mutes, submissions with consent rules, admin dashboard with DB-enforced roles; test all admin permissions.
 
-### M5 — Rewards & polish (≈ 1 week)
-- Stamps, completion screen, R3F reveal (lazy, reduced-motion aware), stamp collection page.
-- Perf pass (budgets), a11y audit (axe + manual screen-reader), Urdu QA.
+### P8 — QA, performance, deployment readiness
+Full functional matrix with evidence, security audit, mobile Safari/Chrome Playwright, deployment instructions (Workers, Render, Neon, auth, storage), explicit list of what cannot be reliable on free tiers.
 
-### M6 — Moderation & content review tooling (≈ 1 week)
-- `/admin` (separate role + MFA): report triage, manual verification review, content review/publish flow that sets `reviewed_by/at`.
-- **DoD:** a quest can only reach `published` through this flow (DB CHECK already backstops).
-
-### M7 — Pilot readiness (≈ 1–2 weeks, **blocked on external inputs**)
-- Real, reviewed Saddar content by local authors with site walk-throughs (SAFE-3); legal texts; emergency-info; age policy; ZAP baseline; incident runbook; privacy impact assessment; app-store/PWA store decisions.
-- Flip nothing to production until all are signed off.
-
-### M8 — Scale & hardening (post-pilot)
-Redis driver/presence for >1 realtime process, region choice review, abuse analytics (privacy-reviewed), push notifications (needs new privacy review).
-
-## Cross-cutting backlog
-- ADR process (append to `architecture.md` §5).
-- Threat-model review at end of M3 and M4.
-- Dependabot + audit weekly; release checklist.
-
-## Risks
-| Risk | Likelihood | Impact | Mitigation |
-|---|---|---|---|
-| Urban GPS inaccuracy (dense Saddar streets, multipath) | High | Failed verifications, frustration | Radius ≥ 15 m configurable per step, accuracy gate tuned from field data, site-code fallback step type |
-| Player safety incident | Low–Med | Severe | SAFE-1…7, daylight default, public-space-only, local reviewer sign-off, report flow |
-| Mobile web background/tab-suspension kills GPS & sockets | High | Broken sessions | Foreground-only design, fast reconnection, resume UI; evaluate native wrapper only if pilot data demands |
-| Content authenticity/sensitivity | Med | Reputational | Placeholder-only until local reviewers; CONTENT-1 guard |
-| Legal (age, location data, local regs) | Med | Blocks launch | Early counsel (OQ-1), minimal-data design |
-| Colyseus single-node limit | Low (pilot) | Outage | Budget tests in M3, Redis path in M8 |
-| Tile provider cost/availability | Med | Map broken | Provider TBD (OQ-7); style abstraction in `packages/map`; cache pilot bbox |
+## Risks (revision 2)
+| Risk | Impact | Mitigation |
+|---|---|---|
+| **No free always-on WebSocket host verified** | lobby offline/slow to wake | best-effort lobby; app works without it; fallback = Durable Objects rewrite or self-hosted tunnel; no pinger hack |
+| Workers Free 10 ms CPU | 5xx on heavy routes | thin routes, CSR game shell, cache; spike (c); fallback static export |
+| Worker size limit conflict (3 MiB vs 64 MiB) | OpenNext deploy fails | spike (c) before building features |
+| Neon 5-min suspend + 100 CU-h (maybe 50) | slow first request, quota exhaustion | waking UI, retry, measure; design to 50 CU-h |
+| Neon storage 1 GB (maybe 0.5 GB) | writes fail | retention, size monitor, no images in DB |
+| Magic link needs domain | feature unavailable | feature flag; Google + guest always work |
+| Guest anonymous plugin only self-hosted | more code to own | accepted; same library |
+| Neon Object Storage Beta / unknown app credentials | photo storage blocked | Cloudinary fallback behind `StorageAdapter` |
+| OpenFreeMap fair-use could change | map tiles lost | style URL env; PMTiles fallback |
+| Urban GPS inaccuracy, player safety, legal (age/location law) | as before | unchanged from revision 1 (SAFE/PRIV requirements preserved) |
 
 ## Definition of done (all milestones)
-Typecheck + lint + boundary check + tests green; new tables have RLS + tests; new messages have Zod contracts + tests; docs updated; no new secret in client; budgets met.
+typecheck + lint + tests (real Postgres) green; every new table has RLS+grants+tests; every new message/route has a Zod contract + test; no privileged credential in any client/realtime artifact; docs updated; **no paid service introduced**.

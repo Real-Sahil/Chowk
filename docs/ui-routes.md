@@ -36,11 +36,13 @@ Milestone column maps to [`implementation-plan.md`](./implementation-plan.md).
 ### Route handlers (`app/api`)
 | Endpoint | Method | Purpose |
 |---|---|---|
-| `/api/account` | DELETE | Delete account (admin API, cascades) |
+| `/api/account` | DELETE | Delete account (Better Auth + DB cascade + storage cleanup) |
 | `/api/account/export` | GET | JSON export of own rows |
 | `/api/consent` | POST | Append consent record (`RecordConsentInput`) |
-| `/api/parties/join` | POST | Edge rate-limited wrapper around `join_party` RPC |
-| `/api/tiles/[...path]` | GET | Tile proxy hiding provider key (if needed, OQ-7) |
+| `/api/parties/join` | POST | Rate-limited wrapper around the `join_party` SQL function |
+| `/api/realtime/ticket` | POST | Mint short-lived signed realtime join ticket |
+| `/api/runs/[id]/steps/[id]/verify` | POST | Server-side GPS/QR/photo verification |
+| `/api/internal/maintenance` | POST | Secret-protected retention sweep (free scheduler) |
 | `/api/health` | GET | Liveness |
 
 ## 2. Screen/component inventory
@@ -62,7 +64,7 @@ Milestone column maps to [`implementation-plan.md`](./implementation-plan.md).
 ## 3. Client state (Zustand stores)
 | Store | Holds | Persisted |
 |---|---|---|
-| `useSessionStore` | auth session snapshot, isGuest | no (Supabase handles storage) |
+| `useSessionStore` | auth session snapshot, isGuest | no (HttpOnly cookie is the source of truth) |
 | `useMapStore` | viewport, follow-mode | no |
 | `useRoomStore` | Colyseus connection status, party snapshot, member cells | no |
 | `useRunStore` | active run view, verification UI state | no |
