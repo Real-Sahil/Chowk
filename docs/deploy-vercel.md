@@ -38,6 +38,17 @@
 5. Deploy. Check `GET /api/health` → `{"ok":true}` (the first call after idle may be slow: Neon wakes up).
 6. At first deploy add `attachDatabasePool` from `@vercel/functions` around the `pg` pools in `lib/services.ts` (Vercel's recommendation; not yet added because it could not be tested locally).
 
+## Verify your deployment (run these yourself; they print PASS/FAIL only, never secrets)
+```bash
+# 1. The live web app (creates a throwaway guest, exercises the API, deletes it again):
+bash apps/web/scripts/verify-deployment.sh https://<your-app>.vercel.app
+
+# 2. The Neon setup (roles, pooler hosts, RLS, no identity leakage through the pooler). Run in your own shell:
+DATABASE_URL='<chowk_app pooled>' AUTH_DATABASE_URL='<chowk_auth pooled>' DATABASE_URL_UNPOOLED='<owner direct>' \
+  pnpm --filter @chowk/db exec tsx scripts/verify-neon.ts
+```
+Expected on a correct deployment: **every line PASS**. Notes: the cookie check requires `APP_ENV=staging` or `production` on Vercel (Secure cookies); `APP_ENV=local` will fail it by design. The first request can be slow while Neon and Vercel wake up.
+
 ## Login is optional
 Every visitor is given a guest session automatically (30-day sliding cookie, no email/password). Guest progress lives with that browser's cookie: **clearing cookies loses a guest account**. Linking Google (optional, needs your Google OAuth client) or magic link (optional, needs an email sender) moves the guest's progress to a permanent account and is never required to play.
 
