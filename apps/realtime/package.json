@@ -1,0 +1,7 @@
+{
+  "name": "@chowk/realtime",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Colyseus server. Scaffolded in M3 (see docs/implementation-plan.md); intentionally empty now."
+}

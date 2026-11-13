@@ -1,0 +1,7 @@
+{
+  "name": "@chowk/web",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Next.js App Router PWA. Scaffolded in M0 (see docs/implementation-plan.md); intentionally empty now."
+}
