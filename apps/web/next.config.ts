@@ -1,6 +1,9 @@
 import type { NextConfig } from "next";
+import { fileURLToPath } from "node:url";
 
 const config: NextConfig = {
+  // Monorepo: trace server files from the repo root so workspace packages are bundled correctly on Vercel.
+  outputFileTracingRoot: fileURLToPath(new URL("../..", import.meta.url)),
   // Workspace packages are consumed as TypeScript source.
   transpilePackages: ["@chowk/contracts", "@chowk/db", "@chowk/ports"],
   serverExternalPackages: ["pg", "@neondatabase/serverless"],
