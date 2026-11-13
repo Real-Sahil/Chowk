@@ -1,0 +1,7 @@
+{
+  "name": "@chowk/e2e",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Playwright suite. Scaffolded in M0."
+}
