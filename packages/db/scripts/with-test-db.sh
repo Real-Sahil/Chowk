@@ -11,7 +11,8 @@ run_as() { if [[ $EUID -eq 0 ]]; then su postgres -c "$*"; else bash -c "$*"; fi
 [[ $EUID -eq 0 ]] && { id postgres >/dev/null 2>&1 || useradd -m postgres; chown postgres "$D"; }
 cleanup() { run_as "$BIN/pg_ctl -D $D/pg stop -m fast >/dev/null 2>&1" || true; rm -rf "$D"; }
 trap cleanup EXIT
-run_as "$BIN/initdb -D $D/pg -A trust >/dev/null && $BIN/pg_ctl -D $D/pg -o '-p $PORT -k $D' -l $D/pg.log -w start >/dev/null"
+# Superuser (migrations) is trusted locally; the two runtime roles MUST present their password, as on Neon.
+run_as "$BIN/initdb -D $D/pg -A trust >/dev/null && printf 'host all chowk_app,chowk_auth 127.0.0.1/32 scram-sha-256\\n%s\\n' \"\$(cat $D/pg/pg_hba.conf)\" > $D/pg/pg_hba.new && mv $D/pg/pg_hba.new $D/pg/pg_hba.conf && $BIN/pg_ctl -D $D/pg -o '-p $PORT -k $D' -l $D/pg.log -w start >/dev/null"
 export TEST_OWNER_URL="postgres://postgres@127.0.0.1:$PORT/postgres"
 psql "$TEST_OWNER_URL" -q -v ON_ERROR_STOP=1 -c "create database chowk_test" >/dev/null
 export TEST_OWNER_URL="postgres://postgres@127.0.0.1:$PORT/chowk_test"
