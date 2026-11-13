@@ -1,5 +1,5 @@
 import { sql } from "drizzle-orm";
-import type { SqlExecutor } from "./context.js";
+import type { SqlExecutor } from "./context";
 
 interface Row {
   rolname: string;

@@ -3,6 +3,8 @@
 > **Revision 2.** Supabase has been removed completely. The product specification was never attached (see
 > [`open-questions.md`](./open-questions.md)); all product behaviour is unchanged from revision 1.
 > Every external service, quota and limitation is in [`free-tier.md`](./free-tier.md). **Constraint: free resources only.**
+>
+> **Hosting update (Prompt 3):** the web app starts on **Vercel Hobby** (Node runtime, Fluid compute), not Cloudflare Workers. Vercel Hobby is *non-commercial only* (verified; see `free-tier.md` §3). Cloudflare Workers/OpenNext remains the documented fallback. Colyseus still runs on a separate host (Vercel WebSockets are public beta, per-instance in-memory state, bounded by function duration — unsuitable for a stateful game room).
 
 ## 1. System overview
 
@@ -11,12 +13,12 @@
  Next.js UI · Tailwind/shadcn · Zustand · MapLibre · React Three Fiber · colyseus.js
    │  HTTPS (cookie session)                         │  WSS (short-lived signed join ticket)
    ▼                                                  ▼
- Next.js on Cloudflare Workers (OpenNext)            Colyseus on Render free web service  ← may SLEEP / restart
+ Next.js on Vercel Hobby (Node runtime)              Colyseus on Render free web service  ← may SLEEP / restart
   - pages, route handlers, server services            - lobby + party presence, chat, emotes (ephemeral memory)
   - Better Auth (self-hosted) + Drizzle               - NO database credentials, NO privileged writes
   - ALL privileged game writes (verification,         - verifies ticket signature with a PUBLIC key
     rewards, moderation) happen here                  
-   │ Drizzle over Neon serverless driver (WebSocket Pool), role = chowk_app (RLS enforced)
+   │ Drizzle over `pg` (module-scope pool, Neon -pooler) as chowk_app (RLS enforced); auth module uses a SECOND role chowk_auth
    ▼
  Neon Postgres (Free): pooled endpoint (-pooler) for runtime, direct endpoint for migrations only
    └─ also: object storage via StorageAdapter (Neon Object Storage or Cloudinary; photos private)
@@ -72,7 +74,7 @@ apps/realtime → contracts, ports(types), game-core, @colyseus/*, jose    ← N
 ## 3. Replaceable adapters (ports)
 | Port | Interface | Implementations | Swap impact |
 |---|---|---|---|
-| Database | `DatabaseAdapter<Tx>` `{withActor, ping, close}` | `createNeonAdapter` (WebSocket pool; Workers) · `createNodeAdapter` (`pg`; Render, scripts, tests, any Postgres) | Any Postgres with the 001 bootstrap works (Neon → local → another host) |
+| Database | `DatabaseAdapter<Tx>` `{withActor, ping, close}` | `createNodeAdapter` (`pg`; **Vercel Node runtime**, Render, scripts, tests, any Postgres) · `createNeonAdapter` (WebSocket pool; edge/Workers only — implemented, **not yet exercised against Neon**) | Any Postgres with the 001 bootstrap works (Neon → local → another host) |
 | Authentication | `AuthAdapter` `{getSession, deleteUser}` + `RealtimeTicketAdapter` | Better Auth (self-hosted) | App code depends only on `AuthSession {userId,isGuest}` |
 | Storage | `StorageAdapter` `{putPrivate, createSignedReadUrl, delete}` | `local-fs` (dev/test) · Neon Object Storage / Cloudinary (after spike) | Keys are server-generated; callers never see provider SDKs |
 
@@ -109,7 +111,7 @@ Honest limit: `chowk_app` can technically call `set_config` itself, so RLS defen
 Parties, members, invitations live in Postgres (RLS: members see their party; invitations visible to inviter/invitee; blocks enforced in the `invite`/`join` SQL functions both ways). Presence/ready state and coarse-cell sharing are ephemeral in the Colyseus party room. Size 2–6, one live party per user (partial unique index), leader promotion in SQL.
 
 ### 4.6 Scheduled jobs
-Retention sweep + expiry are SQL functions invoked by `POST /api/internal/maintenance` (shared-secret header, rate-limited) from a free scheduler (⚠ Worker Cron Trigger or GitHub Actions — see `free-tier.md`). If no scheduler is available, the same sweep also runs opportunistically (at most once/hour, guarded by a DB advisory-style row lock) at the start of authenticated requests.
+Retention sweep + expiry is the SQL function `app.maintenance_purge()` (implemented; executable by `chowk_auth` only), invoked by `POST /api/internal/maintenance` (shared-secret header, rate-limited) from a free scheduler (⚠ Vercel Cron free allowance, GitHub Actions — unverified, see `free-tier.md`). If no scheduler is available, the same sweep also runs opportunistically (at most once/hour, guarded by a DB advisory-style row lock) at the start of authenticated requests.
 
 ## 5. Features needing an alternative implementation (summary)
 | Feature | Why | Alternative |
@@ -124,7 +126,7 @@ Retention sweep + expiry are SQL functions invoked by `POST /api/internal/mainte
 | Turnstile/Sentry | free terms unverified | per-IP rate limiting; structured logs |
 
 ## 6. Performance and mobile budgets (unchanged)
-Initial route ≤ 170 KB gzip JS; map/3D lazy; LCP ≤ 2.5 s on throttled 4G; GPS only on user action; lobby WebSocket ≤ 10 msgs/s/client; Workers 10 ms CPU budget tracked in CI via the dry-run + a load test (M0).
+Initial route ≤ 170 KB gzip JS; map/3D lazy; LCP ≤ 2.5 s on throttled 4G; GPS only on user action; lobby WebSocket ≤ 10 msgs/s/client; Vercel Hobby budgets (4 h Active CPU, 1M invocations/month) tracked once deployed.
 
 ## 7. ADR log
 | # | Decision | Alternatives rejected |
@@ -138,4 +140,6 @@ Initial route ≤ 170 KB gzip JS; map/3D lazy; LCP ≤ 2.5 s on throttled 4G; GP
 | 7 | Drizzle + `withActor` is the only DB path; restricted role + RLS | service role/owner at runtime; PostgREST/Data API |
 | 8 | Privileged writes = `SECURITY DEFINER` functions | `BYPASSRLS` role; "system" claim in a setting |
 | 9 | Neon `-pooler` for runtime, direct for migrations | direct everywhere (connection exhaustion) |
-| 10 | Cloudflare Workers for web; Render free for Colyseus (best-effort) | Cloudflare for Colyseus (impossible); paid hosts (forbidden) |
+| 10 | **Vercel Hobby** for web (starting point; non-commercial); Render free for Colyseus (best-effort); Cloudflare Workers = fallback | Cloudflare for Colyseus (impossible); paid hosts (forbidden) |
+| 11 | Two DB roles: `chowk_app` (product, RLS) and `chowk_auth` (auth schema + guest-link function only) | one role for everything (product code could read sessions/password hashes) |
+| 12 | Auth/UI separation: Better Auth tables live in schema `auth`, invisible to `chowk_app` | shared `public` schema |

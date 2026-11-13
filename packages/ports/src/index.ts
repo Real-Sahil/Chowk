@@ -1,3 +1,3 @@
-export * from "./db.js";
-export * from "./auth.js";
-export * from "./storage.js";
+export * from "./db";
+export * from "./auth";
+export * from "./storage";

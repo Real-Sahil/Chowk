@@ -14,7 +14,8 @@ Principle: ship the thinnest vertical slice that proves the loop (**guest → lo
 
 ## Milestones (re-sequenced to the revision-2 prompts)
 
-### P3 — Database, auth, foundation
+### P3 — Database, auth, foundation  ✅ implemented locally (not deployed)
+**Done with evidence:** 23-table Drizzle schema + migrations (RLS, grants, definer fns), seed of 3 PLACEHOLDER trails (4/5/3 steps), Better Auth (guest, magic link flag, Google wiring, linking with progress transfer, deletion), env validation, services; 43 DB + 11 auth tests + 11 HTTP smoke checks pass. **Still open:** run against real Neon/PgBouncer, real Google code exchange, Vercel deploy, shared rate limiter, `attachDatabasePool`.
 - Drizzle schema + hand-written SQL (RLS, grants, definer functions) for the 17 tables in `database.md` §3; seed fictional Saddar content (3 quests, all `PLACEHOLDER`).
 - Better Auth in `apps/web`: Google OAuth, guest, magic link (flagged), account deletion, `transfer_guest_progress`.
 - **Spikes (gate decisions):** (a) Neon project: run the RLS suite through the real `-pooler` endpoint; measure cold-start; (b) Better Auth anonymous plugin email requirement; (c) `wrangler deploy --dry-run` bundle size + CPU test; (d) Neon Object Storage credentials for apps vs Cloudinary private delivery.

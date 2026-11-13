@@ -1,6 +1,6 @@
 import { z } from "zod";
-import { GeoFix } from "./geo.js";
-import { QuestId, QuestRunId, QuestStepId } from "./ids.js";
+import { GeoFix } from "./geo";
+import { QuestId, QuestRunId, QuestStepId } from "./ids";
 
 /**
  * HTTP contracts for privileged game operations. These run in Next.js server routes (NOT in Colyseus):

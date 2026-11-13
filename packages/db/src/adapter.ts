@@ -4,9 +4,9 @@ import { sql } from "drizzle-orm";
 import pg from "pg";
 import { Pool as NeonPool, neonConfig } from "@neondatabase/serverless";
 import type { DatabaseAdapter, DbActor } from "@chowk/ports";
-import { bindActor } from "./context.js";
-import { assertUnprivilegedRole } from "./guard.js";
-import { loadDbEnv, type DbEnv } from "./env.js";
+import { bindActor } from "./context";
+import { assertUnprivilegedRole } from "./guard";
+import { loadDbEnv, type DbEnv } from "./env";
 
 type AnyDb = NodePgDatabase | NeonDatabase;
 export type ChowkTx<D extends AnyDb> = Parameters<Parameters<D["transaction"]>[0]>[0];

@@ -1,6 +1,6 @@
 import { z } from "zod";
-import { LocationId, QuestId, QuestRunId, QuestStepId, PartyId } from "./ids.js";
-import { Latitude, Longitude as _Lng } from "./geo.js";
+import { LocationId, QuestId, QuestRunId, QuestStepId, PartyId } from "./ids";
+import { Latitude, Longitude as _Lng } from "./geo";
 
 /** Every piece of seed content must carry this. Enforced in DB + CI (docs/security.md, CONTENT-1). */
 export const ContentProvenance = z.enum(["placeholder", "reviewed"]);

@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { DisplayName, PartyId, PartyJoinCode, UserId } from "./ids.js";
+import { DisplayName, PartyId, PartyJoinCode, UserId } from "./ids";
 
 export const PartyStatus = z.enum(["forming", "in_run", "disbanded"]);
 export type PartyStatus = z.infer<typeof PartyStatus>;

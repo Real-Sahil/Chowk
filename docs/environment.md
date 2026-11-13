@@ -4,11 +4,12 @@ Names live in [`/.env.example`](../.env.example). Limits, sleep behaviour and un
 **Free resources only — never add a payment method to any provider account.**
 
 ## Where each secret may live
-| Variable | Cloudflare (web) | Render (realtime) | Developer/CI shell | Browser |
+| Variable | Vercel (web) | Render (realtime) | Developer/CI shell | Browser |
 |---|---|---|---|---|
 | `DATABASE_URL` (restricted `chowk_app`, pooled) | **yes** | **NO** | tests | **NO** |
 | `DATABASE_URL_UNPOOLED` (owner, direct) | **NO** | **NO** | **migrations only** | **NO** |
-| `CHOWK_APP_PASSWORD` | NO | NO | bootstrap only | NO |
+| `AUTH_DATABASE_URL` (restricted `chowk_auth`, auth module only) | **yes** | **NO** | tests | **NO** |
+| `CHOWK_APP_PASSWORD`, `CHOWK_AUTH_PASSWORD` | NO | NO | bootstrap only | NO |
 | `BETTER_AUTH_SECRET`, `GOOGLE_CLIENT_SECRET`, `RESEND_API_KEY` | yes | NO | local | NO |
 | `REALTIME_TICKET_PRIVATE_KEY` | **yes (only here)** | NO | local | NO |
 | `REALTIME_TICKET_PUBLIC_KEY` | yes | yes | yes | no need |
@@ -24,7 +25,8 @@ The realtime server is configured with **no database variables at all**. CI scan
 | Service | Role | Status |
 |---|---|---|
 | Neon (Postgres + optional Object Storage) | database, maybe photos | to create; Free plan |
-| Cloudflare Workers (OpenNext) | web + API | to create; spike for size/CPU first |
+| Vercel Hobby | web + API | to create (**non-commercial only**); see `deploy-vercel.md` |
+| Cloudflare Workers (OpenNext) | fallback web host | not used now |
 | Render free web service | Colyseus (best-effort, sleeps) | to create |
 | Google Cloud OAuth client | Google sign-in | to create (no billing) |
 | Email sender (Resend free) | magic link | **blocked until a verified domain exists**; otherwise disabled |

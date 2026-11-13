@@ -1,7 +1,7 @@
 import { z } from "zod";
-import { CoarseCell, GeoFix } from "./geo.js";
-import { PartyId, QuestRunId, UserId } from "./ids.js";
-import { PartyView } from "./party.js";
+import { CoarseCell, GeoFix } from "./geo";
+import { PartyId, QuestRunId, UserId } from "./ids";
+import { PartyView } from "./party";
 
 /**
  * Colyseus wire contract (lobby + party presence only; privileged game writes are HTTP, see api.ts). Every message is `type` + `payload`; every payload is validated

@@ -1,6 +1,6 @@
 # Chowk — Database (Neon PostgreSQL + Drizzle)
 
-Status: **access layer implemented and tested** (`packages/db`); **table schema is designed here and implemented in Prompt 3** as Drizzle migrations. The revision-1 Supabase migration was deleted (it depended on `auth.users`, `auth.uid()`, PostgREST roles and Supabase RPCs); its design intent is carried forward below.
+Status: **implemented and tested**: access layer, Drizzle schema (`src/schema`), generated + hand-written migrations (`migrations/0000_init_tables.sql`, `0001_rls_and_functions.sql`), seed (`seed/`). 43 DB tests pass on real PostgreSQL 16. **Definer functions for verification, rewards, parties and moderation are added in later stages** — until then those tables are read-only to the app role (by grants), which the tests verify. The revision-1 Supabase migration was deleted (it depended on `auth.users`, `auth.uid()`, PostgREST roles and Supabase RPCs); its design intent is carried forward below.
 Quotas, sleep behaviour and pooling constraints: [`free-tier.md`](./free-tier.md). RLS model: [`security.md`](./security.md) §5.
 
 ## 1. Connections
@@ -8,7 +8,8 @@ Quotas, sleep behaviour and pooling constraints: [`free-tier.md`](./free-tier.md
 |---|---|---|---|---|
 | Runtime | `DATABASE_URL` | Neon **`-pooler`** host (PgBouncer, transaction mode) | `chowk_app` (RLS enforced) | Next.js server only |
 | Migrations / bootstrap / definer-function ownership | `DATABASE_URL_UNPOOLED` | Neon **direct** host | owner | `drizzle-kit`, `scripts/bootstrap-app-role.sh` — a developer or CI job; **never a deployed runtime** |
-| Tests | `DATABASE_URL` + `TEST_OWNER_URL` | throwaway local Postgres | `chowk_app` / superuser | `packages/db` tests |
+| Auth module | `AUTH_DATABASE_URL` | Neon `-pooler` | `chowk_auth` (auth schema only) | Better Auth |
+| Tests | `DATABASE_URL`, `AUTH_DATABASE_URL`, `TEST_OWNER_URL` | throwaway local Postgres | `chowk_app`, `chowk_auth`, superuser | `packages/db`, `apps/web` tests |
 
 Pooling rules (verified, see free-tier §1): no session `SET`, no `LISTEN/NOTIFY`, no SQL-level `PREPARE`, no session advisory locks, no `WITH HOLD` cursors. Identity binding uses `set_config(..., true)` inside the transaction. Runtime on Workers uses the `@neondatabase/serverless` **WebSocket `Pool`** (interactive transactions); Node processes use `pg`. Pool size `DB_POOL_MAX` default 5. Neon compute sleeps after 5 minutes idle: the first query after idle is slower — the API must tolerate it (timeouts ≥ 10 s, retry once on connection error).
 
@@ -26,7 +27,7 @@ packages/db/scripts/with-test-db.sh         throwaway Postgres + vitest
 There is no exported raw pool and no `sql.raw`-with-variables policy: **every query runs inside `withActor`**.
 
 ## 3. Entities (Prompt 3 implements as Drizzle schema + SQL migrations)
-Conventions: `uuid` PKs (`gen_random_uuid()`), `timestamptz`, snake_case, enums as Postgres enums or `CHECK`ed text, `created_at/updated_at` everywhere, `ON DELETE CASCADE` from `users` for personal data, **RLS `ENABLE`+`FORCE` and explicit grants on every table**.
+Conventions: `uuid` PKs (`gen_random_uuid()`), `timestamptz`, snake_case, enums as Postgres enums or `CHECK`ed text, `created_at/updated_at` everywhere, `ON DELETE CASCADE` from `users` for personal data, **RLS enabled and explicit grants on every table** (no `FORCE`; see security.md DB-4).
 
 ### Identity (Better Auth tables + ours)
 - `user, session, account, verification` — created by Better Auth's Drizzle adapter (schema `public` or `auth`; read **only** by the auth module).

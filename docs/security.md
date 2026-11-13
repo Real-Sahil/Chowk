@@ -54,11 +54,13 @@ Requirement IDs (SAFE-n, PRIV-n, AUTH-n, CONTENT-n, ABUSE-n) are referenced from
 | Role | Used by | Privileges | Credential lives in |
 |---|---|---|---|
 | owner / migrator (`neondb_owner` by default) | Drizzle migrations, bootstrap, `SECURITY DEFINER` function ownership | DDL, **bypasses RLS** | `DATABASE_URL_UNPOOLED` — developer shell / CI migration job **only**. Never in Workers, Render or any runtime |
-| `chowk_app` | Next.js server (all DB access) | `LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE`; table grants **per table, least privilege**; no default privileges | `DATABASE_URL` (pooled endpoint) in the Workers secret store |
+| `chowk_auth` | Auth module only (Better Auth) | `LOGIN NOBYPASSRLS`; privileges on schema `auth` tables + `EXECUTE` on `app.transfer_guest_progress`/`app.maintenance_purge`; **no access to product tables** (tested) | `AUTH_DATABASE_URL` in Vercel secrets |
+| `chowk_app` | Next.js server (all product DB access) | `LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE`; table grants **per table, least privilege**; no default privileges | `DATABASE_URL` (pooled endpoint) in the Workers secret store |
 | *(none)* realtime | — | Colyseus has **no** DB role | — |
 
 - **DB-3 startup guard:** `createNodeAdapter/createNeonAdapter` query `pg_roles` for `current_user` and **refuse to start** if superuser/bypassrls/createrole/createdb (tested: owner credential rejected). `loadDbEnv` also rejects `neondb_owner` and (outside `local`) a non-`-pooler` Neon host.
-- **DB-4** Every table in `public` has `ENABLE` **and `FORCE`** row level security and explicit grants beside its policies; `REVOKE ALL ON SCHEMA public FROM PUBLIC`.
+- **DB-4** Every table in `public` **and `auth`** has RLS **enabled** and explicit grants beside its policies; `REVOKE ALL ON SCHEMA public FROM PUBLIC`. (`FORCE ROW LEVEL SECURITY` is deliberately **not** used: `SECURITY DEFINER` functions run as the table owner, who bypasses RLS by design; runtime roles never are the owner, enforced by the startup guard.)
+- **DB-5** `chowk_app` cannot read the `auth` schema, so product code can never reach sessions, tokens or password hashes; `quest_step_secrets` has RLS enabled with **no policy and no grant** (unreadable to every runtime role).
 
 ### 5.2 Identity propagation (user → transaction → policy)
 `DatabaseAdapter.withActor(actor, fn)`:
@@ -91,7 +93,7 @@ Why this is safe on Neon: the pooler is PgBouncer in **transaction mode**; sessi
 - RLS protects against application bugs (IDOR, forgotten filters), cross-user leakage and tampering through any future direct-DB exposure.
 - It does **not** protect against an attacker who can run **arbitrary SQL as `chowk_app`** (they can set `app.user_id` themselves). Mitigations: parameterised Drizzle queries only (lint bans `sql.raw` with variables), no SQL-over-HTTP endpoint, restricted grants, definer functions for sensitive writes, startup role guard, no raw pool exported.
 - Privilege escalation via the app role is limited by column grants (no `role` update), no DDL, no `CREATE` on `public`.
-- Test coverage today: `packages/db/test/rls-context.test.ts` — 15 tests on a real PostgreSQL 16 (isolation, WITH CHECK, no-identity, no leakage on a reused connection, rollback cleanup, injection input, DB-derived admin, no self-promotion, 40-way concurrency, owner-credential refusal, env guards). **Not yet tested through a real PgBouncer or Neon** (needs a Neon project — planned in Prompt 3's CI job).
+- Test coverage today: `packages/db/test/rls-context.test.ts` (15 identity-propagation tests), `schema-rls.test.ts` (24 tests on the REAL migrated schema: per-table isolation, column grants, no direct writes to progress/rewards, replay constraints, block symmetry, consent/photo/submission CHECKs, guest linking, cascading deletion) and `seed.test.ts` (4) — 43 DB tests on a real PostgreSQL 16 (isolation, WITH CHECK, no-identity, no leakage on a reused connection, rollback cleanup, injection input, DB-derived admin, no self-promotion, 40-way concurrency, owner-credential refusal, env guards). **Not yet tested through a real PgBouncer or Neon** (needs a Neon project — planned in Prompt 3's CI job).
 
 ## 6. Application hardening (ABUSE)
 
