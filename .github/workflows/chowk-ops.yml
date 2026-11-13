@@ -1,0 +1,110 @@
+name: Chowk ops (phone-friendly)
+
+# Manual-only. Run from GitHub (web or mobile): Actions -> "Chowk ops (phone-friendly)" -> Run workflow.
+# Secrets are stored in GitHub (Settings -> Secrets and variables -> Actions) and are never printed.
+# The owner database URL lives ONLY here (a CI migration job); it must never be set on Vercel or Render.
+on:
+  workflow_dispatch:
+    inputs:
+      task:
+        description: "What to run"
+        type: choice
+        required: true
+        default: setup-db
+        options:
+          - setup-db          # create roles, apply migrations, (optionally) seed placeholder content
+          - verify-neon       # check roles, pooler, RLS, identity propagation
+          - verify-deployment # check the live Vercel app end to end
+      seed_placeholder_content:
+        description: "setup-db: also seed the fictional PLACEHOLDER quests"
+        type: boolean
+        default: true
+      show_playtest_content:
+        description: "setup-db: make placeholder quests visible (STAGING ONLY, never production)"
+        type: boolean
+        default: false
+      url:
+        description: "verify-deployment: app URL"
+        type: string
+        default: "https://the-chowk-five.vercel.app"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: chowk-ops
+  cancel-in-progress: false
+
+jobs:
+  run:
+    # Only ever run from main so secrets are not exposed to unreviewed branches.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+
+      - name: Ensure psql is available
+        if: inputs.task != 'verify-deployment'
+        run: command -v psql >/dev/null || (sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client)
+
+      - name: Derive runtime URLs (masked, never printed)
+        if: inputs.task != 'verify-deployment'
+        env:
+          NEON_OWNER_URL: ${{ secrets.NEON_OWNER_URL }}
+          CHOWK_APP_PASSWORD: ${{ secrets.CHOWK_APP_PASSWORD }}
+          CHOWK_AUTH_PASSWORD: ${{ secrets.CHOWK_AUTH_PASSWORD }}
+        run: |
+          node --input-type=module -e '
+            import { appendFileSync } from "node:fs";
+            const need = (k) => { const v = process.env[k]; if (!v) { console.error(`Missing GitHub secret ${k}. Add it under Settings > Secrets and variables > Actions.`); process.exit(1); } return v; };
+            const owner = need("NEON_OWNER_URL"), appPw = need("CHOWK_APP_PASSWORD"), authPw = need("CHOWK_AUTH_PASSWORD");
+            for (const s of [owner, appPw, authPw]) console.log("::add-mask::" + s);
+            const u = new URL(owner);
+            if (!/^postgres(ql)?:$/.test(u.protocol)) { console.error("NEON_OWNER_URL must start with postgresql://"); process.exit(1); }
+            if (u.hostname.includes("-pooler")) { console.error("NEON_OWNER_URL must be the DIRECT connection (turn OFF \"Connection pooling\" in Neon), not the pooled one."); process.exit(1); }
+            const [ep, ...rest] = u.hostname.split(".");
+            const pooledHost = [ep + "-pooler", ...rest].join(".");
+            const build = (user, pw) => `postgresql://${user}:${encodeURIComponent(pw)}@${pooledHost}${u.port ? ":" + u.port : ""}${u.pathname}?sslmode=require`;
+            const appUrl = build("chowk_app", appPw), authUrl = build("chowk_auth", authPw);
+            for (const s of [appUrl, authUrl, encodeURIComponent(appPw), encodeURIComponent(authPw)]) console.log("::add-mask::" + s);
+            appendFileSync(process.env.GITHUB_ENV, `DATABASE_URL=${appUrl}\nAUTH_DATABASE_URL=${authUrl}\nDATABASE_URL_UNPOOLED=${owner}\n`);
+            console.log("Derived pooled runtime URLs for chowk_app and chowk_auth (values hidden).");
+          '
+
+      - name: setup-db / roles
+        if: inputs.task == 'setup-db'
+        env:
+          CHOWK_APP_PASSWORD: ${{ secrets.CHOWK_APP_PASSWORD }}
+          CHOWK_AUTH_PASSWORD: ${{ secrets.CHOWK_AUTH_PASSWORD }}
+        run: bash packages/db/scripts/bootstrap-app-role.sh
+
+      - name: setup-db / migrations
+        if: inputs.task == 'setup-db'
+        run: pnpm --filter @chowk/db db:migrate
+
+      - name: setup-db / seed fictional PLACEHOLDER content
+        if: inputs.task == 'setup-db' && inputs.seed_placeholder_content
+        run: pnpm --filter @chowk/db db:seed
+
+      - name: setup-db / playtest visibility flag (staging only)
+        if: inputs.task == 'setup-db'
+        run: |
+          if [ "${{ inputs.show_playtest_content }}" = "true" ]; then V=true; else V=false; fi
+          psql "$DATABASE_URL_UNPOOLED" -v ON_ERROR_STOP=1 -q -c "update app.flags set value = $V where key = 'allow_playtest_content'"
+          echo "allow_playtest_content = $V"
+
+      - name: verify-neon (also runs after setup-db)
+        if: inputs.task == 'setup-db' || inputs.task == 'verify-neon'
+        run: pnpm --filter @chowk/db exec tsx scripts/verify-neon.ts
+
+      - name: verify-deployment
+        if: inputs.task == 'verify-deployment'
+        run: bash apps/web/scripts/verify-deployment.sh "${{ inputs.url }}"
