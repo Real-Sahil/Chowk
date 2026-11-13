@@ -9,7 +9,7 @@ server-verified check-ins — while their precise location never leaves the serv
 > The product spec was not available when this was written — see [`docs/open-questions.md`](docs/open-questions.md).
 
 ## Stack
-Next.js (App Router) on Vercel Hobby (non-commercial; Cloudflare fallback) · TypeScript strict · Tailwind + shadcn/ui · Zustand · **Neon Postgres + Drizzle ORM + PostgreSQL RLS** · **self-hosted Better Auth** · Colyseus (Render free, best-effort) · MapLibre + OpenFreeMap · React Three Fiber · Zod · Playwright · pnpm workspaces.
+Next.js (App Router) on Vercel Hobby (non-commercial; Cloudflare fallback) · TypeScript strict · Tailwind + shadcn/ui · Zustand · **Neon Postgres + Drizzle ORM + PostgreSQL RLS** · **self-hosted Better Auth (guest-first: no login required)** · Colyseus (Render free, best-effort) · MapLibre + OpenFreeMap · React Three Fiber · Zod · Playwright · pnpm workspaces.
 
 **Free resources only.** No paid APIs, subscriptions or infrastructure; see [docs/free-tier.md](docs/free-tier.md) for verified quotas, sleep behaviour and what cannot be reliable for free.
 
@@ -58,7 +58,7 @@ pnpm install
 pnpm typecheck                      # strict TS across workspaces
 pnpm --filter @chowk/db test        # throwaway PostgreSQL + real migrations + seed; 43 RLS/schema tests
 pnpm --filter @chowk/storage test   # 3 storage adapter tests
-pnpm --filter @chowk/web test       # 11 tests: real Better Auth + real DB (guest, link, delete, CSRF)
+pnpm --filter @chowk/web test       # 16 tests: real Better Auth + real DB (guest, link, delete, CSRF)
 pnpm test                           # everything above
 # smoke test of the built server over HTTP:
 pnpm --filter @chowk/web build && bash packages/db/scripts/with-test-db.sh bash -c 'cd apps/web && bash scripts/smoke.sh'

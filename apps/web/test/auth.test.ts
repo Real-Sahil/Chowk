@@ -4,7 +4,8 @@ import { createNodeAdapter, loadDbEnv } from "@chowk/db";
 import { createAuth } from "../lib/auth";
 import { createConsoleSender } from "../lib/email";
 import { loadWebEnv } from "../lib/env";
-import { getAuthSession } from "../lib/session";
+import { ensureSession, getAuthSession } from "../lib/session";
+import { createRateLimiter } from "../lib/ratelimit";
 import { createProfileService } from "../services/profile";
 import { deleteAccount } from "../services/account";
 import { runSeed } from "../../../packages/db/seed/run-seed";
@@ -158,5 +159,45 @@ describe("Google OAuth wiring and feature flags", () => {
     const ok = await call("/api/auth/sign-out", { method: "POST", body: "{}", cookie });
     expect(ok.status).toBe(200);
     expect(await sessionOf(cookie)).toBeNull(); // same-origin sign-out works
+  });
+});
+
+describe("login is never required (automatic guest session)", () => {
+  it("a brand-new visitor with no cookie gets a working guest session; a returning visitor keeps the same one", async () => {
+    const first = await ensureSession(auth, new Headers({ origin: BASE }));
+    expect(first?.created).toBe(true);
+    expect(first?.session.isGuest).toBe(true);
+    const cookie = first!.setCookies.map((c) => c.split(";")[0]).join("; ");
+    const again = await ensureSession(auth, new Headers({ cookie, origin: BASE }));
+    expect(again?.created).toBe(false);
+    expect(again?.session.userId).toBe(first!.session.userId);
+    // the guest can use the product with no email, password or magic link
+    const p = await profiles.update(first!.session.userId, { displayName: "No Login Needed", acceptTerms: { version: "v1" } });
+    expect(p).toMatchObject({ isGuest: true, displayName: "No Login Needed" });
+    expect(first!.setCookies.join(";").toLowerCase()).toContain("httponly");
+  });
+  it("works with magic link switched OFF and Google not configured (the default deployment)", async () => {
+    const bare = createAuth({ env: loadWebEnv({ ...baseEnv, MAGIC_LINK_ENABLED: "false" }), authPool, email });
+    const r = await ensureSession(bare, new Headers({ origin: BASE }));
+    expect(r?.session.isGuest).toBe(true);
+    const ml = await bare.handler(new Request(BASE + "/api/auth/sign-in/magic-link", { method: "POST", headers: { origin: BASE, "content-type": "application/json" }, body: JSON.stringify({ email: "x@example.test" }) }));
+    expect(ml.status).toBeGreaterThanOrEqual(400); // not available, and nothing depends on it
+  });
+  it("returns null (not a crash) when guest mode is disabled", async () => {
+    const off = createAuth({ env: loadWebEnv({ ...baseEnv, GUEST_MODE_ENABLED: "false" }), authPool, email });
+    expect(await ensureSession(off, new Headers({ origin: BASE }))).toBeNull();
+  });
+  it("session cookie lifetime is 30 days (guests keep progress without logging in)", async () => {
+    const r = await ensureSession(auth, new Headers({ origin: BASE }));
+    const maxAge = Number(/max-age=(\d+)/i.exec(r!.setCookies.join(";"))?.[1]);
+    expect(maxAge).toBeGreaterThanOrEqual(60 * 60 * 24 * 29);
+  });
+  it("rate limiter allows the limit then blocks, and resets after the window", () => {
+    let t = 0;
+    const l = createRateLimiter(3, 1000, () => t);
+    expect([l.allow("a"), l.allow("a"), l.allow("a"), l.allow("a")]).toEqual([true, true, true, false]);
+    expect(l.allow("b")).toBe(true);
+    t = 1001;
+    expect(l.allow("a")).toBe(true);
   });
 });

@@ -43,7 +43,8 @@ export function createAuth({ env, authPool, email }: AuthDeps) {
       useSecureCookies: env.APP_ENV === "production" || env.APP_ENV === "staging",
       defaultCookieAttributes: { httpOnly: true, sameSite: "lax" },
     },
-    session: { expiresIn: 60 * 60 * 24 * 7, updateAge: 60 * 60 * 24 },
+    // Sliding 30-day session: guests keep their account without logging in (matches the 30-day inactivity purge).
+    session: { expiresIn: 60 * 60 * 24 * 30, updateAge: 60 * 60 * 24 },
     account: { accountLinking: { enabled: true, trustedProviders: ["google"] } },
     socialProviders: google ? { google } : {},
     plugins: [

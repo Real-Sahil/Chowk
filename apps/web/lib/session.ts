@@ -15,3 +15,23 @@ export async function getAuthSession(auth: ChowkAuth, headers: Headers): Promise
     expiresAt: new Date(s.session.expiresAt),
   };
 }
+
+export interface EnsureResult { session: AuthSession; created: boolean; setCookies: string[] }
+
+/**
+ * Login is NEVER required: every visitor gets a guest session automatically. Idempotent: an existing valid session
+ * is returned as-is. Guests can later (optionally) link Google/magic link to protect their progress; until then,
+ * progress lives with the browser's cookie (clearing cookies loses a guest account - tell players).
+ */
+export async function ensureSession(auth: ChowkAuth, headers: Headers): Promise<EnsureResult | null> {
+  const existing = await getAuthSession(auth, headers);
+  if (existing) return { session: existing, created: false, setCookies: [] };
+  const api = auth.api as unknown as { signInAnonymous?: (o: { headers: Headers; asResponse: true }) => Promise<Response> };
+  if (typeof api.signInAnonymous !== "function") return null; // guest mode disabled (plugin not loaded)
+  const res = await api.signInAnonymous({ headers, asResponse: true });
+  if (!res.ok) return null; // guest mode disabled or failed
+  const setCookies = res.headers.getSetCookie();
+  const cookie = setCookies.map((c) => c.split(";")[0]).join("; ");
+  const created = await getAuthSession(auth, new Headers({ cookie }));
+  return created ? { session: created, created: true, setCookies } : null;
+}

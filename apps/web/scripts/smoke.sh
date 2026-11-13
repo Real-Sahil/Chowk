@@ -9,7 +9,8 @@ for i in $(seq 1 40); do curl -fs "$BASE/api/health" >/dev/null 2>&1 && break; s
 J=$(mktemp); ok() { echo "PASS: $1"; }; bad() { echo "FAIL: $1"; tail -20 /tmp/chowk-next.log; exit 1; }
 [[ "$(curl -s $BASE/api/health)" == '{"ok":true}' ]] && ok "health reaches the database as chowk_app" || bad health
 [[ "$(curl -s -o /dev/null -w '%{http_code}' $BASE/api/profile)" == 401 ]] && ok "profile requires a session (401)" || bad unauth
-curl -s -c $J -H "origin: $BASE" -H 'content-type: application/json' -d '{}' $BASE/api/auth/sign-in/anonymous -o /dev/null -w '%{http_code}\n' | grep -q 200 && ok "guest sign-in" || bad guest
+curl -s -c $J -X POST -H "origin: $BASE" $BASE/api/session | grep -q '"created":true' && ok "automatic guest session (no login, no email)" || bad guest
+curl -s -b $J -c $J -X POST -H "origin: $BASE" $BASE/api/session | grep -q '"created":false' && ok "second visit reuses the same session" || bad reuse
 grep -q HttpOnly $J && ok "session cookie is HttpOnly" || bad httponly
 curl -s -b $J $BASE/api/profile | grep -q '"isGuest":true' && ok "guest profile auto-created" || bad profile
 curl -s -b $J -X PATCH -H 'content-type: application/json' -d '{"displayName":"Smoke Tester","avatarKey":"saffron","acceptTerms":{"version":"v1"},"acceptPrivacy":{"version":"v1"}}' $BASE/api/profile | grep -q '"displayName":"Smoke Tester"' && ok "profile creation + consent" || bad patch

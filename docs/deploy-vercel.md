@@ -1,6 +1,6 @@
 # Deploying Chowk (foundation build) — Vercel Hobby + Neon Free
 
-**Status: NOT deployed.** I had no Vercel or Neon credentials/tooling in this environment, so nothing below has been executed against real services. Everything was verified locally against a real PostgreSQL 16 and the built Next.js server (see "Evidence"). Follow these steps yourself; stop at any step that asks for a payment method.
+**Status: NOT deployed.** In this environment the **Neon connector is not installed** and the **Vercel connector is read-only** (list/get projects and deployments only; no create/deploy), so nothing below has been executed against real services. Once you import the repo into Vercel, the read-only connector can be used to inspect deployments and build logs. Everything was verified locally against a real PostgreSQL 16 and the built Next.js server (see "Evidence"). Follow these steps yourself; stop at any step that asks for a payment method.
 
 > **Vercel Hobby is non-commercial only** (verified, see `free-tier.md` §3a). Use it for building and testing. Do not use it if Chowk earns revenue or is run as a business (OQ-14).
 
@@ -32,11 +32,14 @@
    | `BETTER_AUTH_SECRET` | `openssl rand -base64 48` |
    | `BETTER_AUTH_URL` | your deployment origin, e.g. `https://<project>.vercel.app` |
    | `GUEST_MODE_ENABLED` | `true` |
-   | `MAGIC_LINK_ENABLED` | `false` until a free email sender exists (needs a domain you own; see `free-tier.md` §2). The `console` email provider is **refused** when `APP_ENV=production`. |
+   | `MAGIC_LINK_ENABLED` | `false` (default). **Not needed**: visitors get an automatic guest session (`POST /api/session`), no login or email. Magic link/Google are optional upgrades only. The `console` email provider is refused when `APP_ENV=production`. |
    | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | optional; create a Google Cloud OAuth client (no billing) with redirect URI `<BETTER_AUTH_URL>/api/auth/callback/google` |
 4. Function region: choose the Vercel region nearest your Neon region (Project → Settings → Functions).
 5. Deploy. Check `GET /api/health` → `{"ok":true}` (the first call after idle may be slow: Neon wakes up).
 6. At first deploy add `attachDatabasePool` from `@vercel/functions` around the `pg` pools in `lib/services.ts` (Vercel's recommendation; not yet added because it could not be tested locally).
+
+## Login is optional
+Every visitor is given a guest session automatically (30-day sliding cookie, no email/password). Guest progress lives with that browser's cookie: **clearing cookies loses a guest account**. Linking Google (optional, needs your Google OAuth client) or magic link (optional, needs an email sender) moves the guest's progress to a permanent account and is never required to play.
 
 ## 3. What is deployed vs not
 - ✅ Auth (guest, magic link when enabled, Google when configured), profile, character, account deletion, health.
@@ -49,7 +52,7 @@
 | `pnpm typecheck` (all workspaces, strict) | 0 errors |
 | `@chowk/db` tests (real PG 16, real migrations) | 43 / 43, stable over repeated runs |
 | `@chowk/storage` tests | 3 / 3 |
-| `@chowk/web` tests (real Better Auth + real DB) | 11 / 11 |
+| `@chowk/web` tests (real Better Auth + real DB) | 16 / 16 |
 | `next build` | succeeds; routes `/api/auth/*`, `/api/profile`, `/api/character`, `/api/account`, `/api/health` |
-| Smoke test of the built server over HTTP (`apps/web/scripts/smoke.sh`) | 11 / 11 pass |
+| Smoke test of the built server over HTTP (`apps/web/scripts/smoke.sh`) | 12 / 12 pass |
 | Against Neon / Vercel / real Google | **not run** |
