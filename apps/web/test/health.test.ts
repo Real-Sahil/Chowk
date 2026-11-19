@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import pg from "pg";
 import { classifyHealthError } from "../lib/health";
-import { loadWebEnv } from "../lib/env";
+import { loadWebEnv, runtimeEnvSource } from "../lib/env";
 
 describe("health error classification (safe categories only)", () => {
   it("config errors name the invalid SETTINGS outside production, never values", () => {
@@ -20,6 +20,11 @@ describe("health error classification (safe categories only)", () => {
     expect(c.reason).toBe("config");
     expect(c.detail).toMatch(/^DATABASE_URL: /);
     expect(JSON.stringify(c)).not.toContain("supersecret");
+  });
+  it("APP_DATABASE_URL wins over an integration-supplied DATABASE_URL; DATABASE_URL still works alone", () => {
+    expect(runtimeEnvSource({ DATABASE_URL: "postgres://neondb_owner:x@h/d", APP_DATABASE_URL: "postgres://chowk_app:y@h/d" }).DATABASE_URL).toBe("postgres://chowk_app:y@h/d");
+    expect(runtimeEnvSource({ DATABASE_URL: "postgres://chowk_app:y@h/d" }).DATABASE_URL).toBe("postgres://chowk_app:y@h/d");
+    expect(runtimeEnvSource({ DATABASE_URL: "postgres://chowk_app:y@h/d", APP_DATABASE_URL: "" }).DATABASE_URL).toBe("postgres://chowk_app:y@h/d");
   });
   it("maps database failures to coarse reasons", () => {
     expect(classifyHealthError({ code: "28P01", message: "password authentication failed for user x" }, "staging").reason).toBe("db_auth");

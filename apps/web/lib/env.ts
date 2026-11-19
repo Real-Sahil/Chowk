@@ -30,6 +30,15 @@ export const WebEnv = z
   });
 export type WebEnv = z.infer<typeof WebEnv>;
 
+/**
+ * On Vercel the Neon marketplace integration owns `DATABASE_URL` (an OWNER credential) and a project variable cannot
+ * override it. So production sets the restricted app URL as APP_DATABASE_URL, which wins when present. DATABASE_URL is
+ * still used locally and in tests; loadDbEnv() rejects it if it is the owner role, so the owner URL can never be used.
+ */
+export function runtimeEnvSource(src: Record<string, string | undefined> = process.env): Record<string, string | undefined> {
+  return { ...src, DATABASE_URL: src.APP_DATABASE_URL || src.DATABASE_URL };
+}
+
 export function loadWebEnv(source: Record<string, string | undefined> = process.env): WebEnv {
   const r = WebEnv.safeParse(source);
   if (!r.success) throw new Error("Invalid web environment: " + r.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; "));
