@@ -46,6 +46,9 @@ export function createAuth({ env, authPool, email }: AuthDeps) {
     // Sliding 30-day session: guests keep their account without logging in (matches the 30-day inactivity purge).
     session: { expiresIn: 60 * 60 * 24 * 30, updateAge: 60 * 60 * 24 },
     account: { accountLinking: { enabled: true, trustedProviders: ["google"] } },
+    // Email + password. No verification email is required (no mail provider is configured yet); passwords are hashed by
+    // Better Auth (scrypt) and live only in auth.account, which the app role cannot read.
+    emailAndPassword: { enabled: true, minPasswordLength: 10, maxPasswordLength: 128, requireEmailVerification: false },
     socialProviders: google ? { google } : {},
     plugins: [
       ...(env.GUEST_MODE_ENABLED

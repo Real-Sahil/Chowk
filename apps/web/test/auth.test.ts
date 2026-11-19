@@ -112,6 +112,31 @@ describe("guest -> registered account linking keeps legitimate progress", () => 
   });
 });
 
+describe("email + password sign-up", () => {
+  it("a guest signing up keeps progress; password sign-in works; wrong/short passwords are rejected", async () => {
+    const g = await call("/api/auth/sign-in/anonymous", { method: "POST", body: "{}" });
+    let cookie = jar(g);
+    const guest = (await sessionOf(cookie))!;
+    await profiles.update(guest.userId, { displayName: "Pw Player", acceptTerms: { version: "v1" } });
+    const short = await call("/api/auth/sign-up/email", { method: "POST", body: JSON.stringify({ email: "pw@example.test", password: "short", name: "Pw" }), cookie });
+    expect(short.status).toBeGreaterThanOrEqual(400);
+    const pw = "correct-horse-battery-1";
+    const up = await call("/api/auth/sign-up/email", { method: "POST", body: JSON.stringify({ email: "pw@example.test", password: pw, name: "Pw Player" }), cookie });
+    expect(up.status).toBe(200);
+    cookie = jar(up, cookie);
+    const member = (await sessionOf(cookie))!;
+    expect(member.isGuest).toBe(false);
+    const bad = await call("/api/auth/sign-in/email", { method: "POST", body: JSON.stringify({ email: "pw@example.test", password: "wrong-password-123" }) });
+    expect(bad.status).toBeGreaterThanOrEqual(400);
+    const ok = await call("/api/auth/sign-in/email", { method: "POST", body: JSON.stringify({ email: "pw@example.test", password: pw }) });
+    expect(ok.status).toBe(200);
+    expect((await sessionOf(jar(ok)))!.userId).toBe(member.userId);
+    // the stored credential is a hash, not the password
+    const h = (await owner.query(`select password from auth.account where user_id=$1 and provider_id='credential'`, [member.userId])).rows[0].password as string;
+    expect(h).not.toContain(pw);
+  });
+});
+
 describe("account deletion", () => {
   it("removes every personal row and invalidates the session on all devices", async () => {
     const g = await call("/api/auth/sign-in/anonymous", { method: "POST", body: "{}" });
