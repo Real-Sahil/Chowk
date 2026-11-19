@@ -9,8 +9,9 @@ export function classifyHealthError(e: unknown, appEnv: string): { reason: Healt
   const code = err.code ?? err.cause?.code;
   const msg = String(err.message ?? "");
   if (msg.startsWith("Invalid web environment") || msg.startsWith("Invalid database environment")) {
-    const names = [...msg.matchAll(/(?:^|[:;]\s*)([A-Z][A-Z0-9_]{3,})\s*:/g)].map((m) => m[1]);
-    return { reason: "config", ...(appEnv !== "production" && names.length ? { detail: [...new Set(names)].join(", ") } : {}) };
+    // Zod issues are "<FIELD>: <fixed reason>" and never echo the value, so this is safe to show outside production.
+    const issues = msg.replace(/^Invalid (?:web|database) environment:\s*/, "").slice(0, 300);
+    return { reason: "config", ...(appEnv !== "production" && issues ? { detail: issues } : {}) };
   }
   if (msg.includes("is privileged")) return { reason: "db_role" };
   if (code === "28P01" || code === "28000") return { reason: "db_auth" };

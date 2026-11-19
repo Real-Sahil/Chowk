@@ -14,6 +14,13 @@ describe("health error classification (safe categories only)", () => {
     expect(JSON.stringify(c)).not.toContain("supersecret");
     expect(classifyHealthError(new Error(msg.replace(/^Error: /, "")), "production").detail).toBeUndefined();
   });
+  it("database env config errors give the field and fixed reason, never the URL or password", () => {
+    const e = (() => { try { return loadWebEnv({ APP_ENV: "staging", DATABASE_URL: "not a url with supersecret", AUTH_DATABASE_URL: "postgres://a:b@h/d", BETTER_AUTH_SECRET: "x".repeat(32), BETTER_AUTH_URL: "https://x.test" }); } catch (err) { return err; } })();
+    const c = classifyHealthError(e, "staging");
+    expect(c.reason).toBe("config");
+    expect(c.detail).toMatch(/^DATABASE_URL: /);
+    expect(JSON.stringify(c)).not.toContain("supersecret");
+  });
   it("maps database failures to coarse reasons", () => {
     expect(classifyHealthError({ code: "28P01", message: "password authentication failed for user x" }, "staging").reason).toBe("db_auth");
     expect(classifyHealthError({ code: "ENOTFOUND", message: "getaddrinfo ENOTFOUND host" }, "staging").reason).toBe("db_unreachable");
