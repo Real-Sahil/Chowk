@@ -16,6 +16,7 @@
     "@chowk/ports": "workspace:*",
     "better-auth": "^1.7.22",
     "drizzle-orm": "^0.45.4",
+    "maplibre-gl": "^6.19.0",
     "next": "^16.4.6",
     "pg": "^8.23.1",
     "react": "^19.3.1",
