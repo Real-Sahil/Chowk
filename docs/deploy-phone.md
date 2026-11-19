@@ -15,7 +15,7 @@ GitHub → repo → **Actions** → **Chowk ops (phone-friendly)** → **Run wor
 
 ## Vercel environment variables
 Vercel app/site → the-chowk → **Settings → Environment Variables** (Production). Build the two URLs from Neon's **pooled** string (Connection pooling ON; host contains `-pooler`), replacing the user and password:
-- `DATABASE_URL` = `postgresql://chowk_app:<CHOWK_APP_PASSWORD>@<pooled-host>/<database>?sslmode=require`
+- `APP_DATABASE_URL` (not `DATABASE_URL`: the Neon integration owns that name on Vercel and fills it with an owner credential) = `postgresql://chowk_app:<CHOWK_APP_PASSWORD>@<pooled-host>/<database>?sslmode=require`
 - `AUTH_DATABASE_URL` = `postgresql://chowk_auth:<CHOWK_AUTH_PASSWORD>@<pooled-host>/<database>?sslmode=require`
 - `APP_ENV` = `staging`, `BETTER_AUTH_URL` = `https://the-chowk-five.vercel.app`, `BETTER_AUTH_SECRET` = a random 48+ character string, `GUEST_MODE_ENABLED` = `true`
 - Never add the owner URL (`NEON_OWNER_URL`) to Vercel.
